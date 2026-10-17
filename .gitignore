@@ -1,0 +1,19 @@
+# secrets — local dev only, never commit
+worker/.dev.vars
+
+# wrangler local state (cache, tmp)
+.wrangler/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# node
+node_modules/
+
+# macOS
+.DS_Store
+
+# logs
+*.log
