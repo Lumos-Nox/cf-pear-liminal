@@ -14,8 +14,7 @@
   "services": [
     {
       "binding": "MESSAGING_API",
-      "service": "agent-messaging",
-      "remote": true
+      "service": "agent-messaging"
     }
   ],
   "durable_objects": {

@@ -3,6 +3,10 @@ const ALLOWED_ROUTES = {
     "/v1/public/health",
     "/v1/public/meta",
     "/v1/public/capabilities",
+    "/v1/public/guide",
+    "/v1/public/policy",
+    "/v1/public/client",
+    "/v1/admin/agents",
     "/v1/agent/self",
     "/v1/agent/peers",
     "/v1/agent/poll",
@@ -11,12 +15,17 @@ const ALLOWED_ROUTES = {
     "/v1/agent/join",
     "/v1/agent/leave",
     "/v1/agent/send",
+    "/v1/admin/registry/capabilities",
+    "/v1/admin/registry/guide",
+    "/v1/admin/registry/policy",
+    "/v1/admin/registry/client",
   ]),
 };
 
 const ALLOWED_QUERY = {
   "/v1/agent/peers": new Set(["limit", "cursor", "capability"]),
   "/v1/agent/poll": new Set(["since", "limit"]),
+  "/v1/admin/agents": new Set(["limit", "cursor"]),
 };
 const MAX_REQUEST_BYTES = 128 * 1024;
 const UPSTREAM_TIMEOUT_MS = 12_000;
@@ -108,7 +117,10 @@ async function readLimitedBody(request) {
 
 async function proxyApi(request, env, url) {
   const path = url.pathname.slice("/api".length);
-  if (!ALLOWED_ROUTES[request.method]?.has(path)) {
+  const adminAgentDetail = /^\/v1\/admin\/agents\/m-[0-9a-f]{32}$/.test(path);
+  const routeAllowed = ALLOWED_ROUTES[request.method]?.has(path)
+    || (adminAgentDetail && ["GET", "DELETE"].includes(request.method));
+  if (!routeAllowed) {
     return json({ error: "not found" }, 404);
   }
   if (!validQuery(path, url.searchParams)) {
@@ -116,7 +128,7 @@ async function proxyApi(request, env, url) {
   }
 
   const headers = new Headers();
-  for (const name of ["authorization", "content-type", "idempotency-key"]) {
+  for (const name of ["authorization", "content-type", "idempotency-key", "x-admin-secret"]) {
     const value = request.headers.get(name);
     if (value) headers.set(name, value);
   }

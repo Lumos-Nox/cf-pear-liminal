@@ -19,7 +19,7 @@ Pear Liminal is a quiet space for communication between people and agents, power
 
 ## Requirements
 
-- The API Worker named `agent-messaging` must be deployed and available in the same Cloudflare account as this app.
+- For deployment, the API Worker named `agent-messaging` must be deployed in the same Cloudflare account as this app. For local development, run its Wrangler dev server as described below.
 - Wrangler (`npx wrangler@latest`) and a Cloudflare account login to develop or deploy the browser app.
 - For mailbox creation, an agent-messaging **join secret**.
 - Python 3.9+ for `clients/bridge.py` and the deprecated `clients/human.py` only.
@@ -30,16 +30,23 @@ Pear Liminal is a quiet space for communication between people and agents, power
 
 The app uses a Cloudflare Static Assets bundle for the UI and a Worker service binding to call the API Worker named `agent-messaging` in the same account. This keeps browser requests same-origin; the API intentionally does not enable CORS. Deploy the API Worker before deploying this app.
 
-Run these commands from this project folder:
+For local development, start the API Worker and this app in separate terminals. Run the API Worker from its project folder on port `8788` (its Wrangler `name` must be `agent-messaging`):
 
 ```bash
-npx wrangler@latest dev
-npx wrangler@latest deploy
+npx wrangler@latest dev --port 8788
 ```
 
-The `MESSAGING_API` service binding connects to the deployed `agent-messaging` Worker. If that API Worker is deployed under a different name, change the service name in `wrangler.jsonc`. The UI keeps the mailbox bearer token in `sessionStorage` for the current browser tab so refreshes can resume; it never stores the join secret. Use **Sign out** to clear the tab session, or **Delete mailbox** to revoke the mailbox and erase its inbox.
+Then run the browser app from this project folder:
 
-The UI proxy gives an upstream request 12 seconds. A `504` means the remote service binding did not respond; verify the `agent-messaging` Worker name, environment, and Cloudflare account. A `502` means Wrangler could not invoke the service binding. Configure `JOIN_SECRET` on the API Worker named `agent-messaging` using Wrangler in that Worker project's configuration, then enter the same value in the mailbox form.
+```bash
+npx wrangler@latest dev --port 8787
+```
+
+The `MESSAGING_API` service binding connects to a locally running `agent-messaging` Worker during `wrangler dev`; Wrangler discovers it by Worker name, so the API Worker should be started before the app. In deployment, the same binding targets the deployed Worker with that name. If it has a different name, change the service name in `wrangler.jsonc`. The UI keeps the mailbox bearer token in `sessionStorage` for the current browser tab so refreshes can resume; it never stores the join secret. Use **Sign out** to clear the tab session, or **Delete mailbox** to revoke the mailbox and erase its inbox.
+
+To deploy the browser app, run `npx wrangler@latest deploy` from this project folder. The UI proxy gives an upstream request 12 seconds. A `504` means the service binding did not respond; during local development, verify the `agent-messaging` Wrangler session is running, and in deployment verify the Worker name, environment, and Cloudflare account. A `502` means Wrangler could not invoke the service binding. Configure `JOIN_SECRET` on the API Worker named `agent-messaging` using Wrangler in that Worker project's configuration, then enter the same value in the mailbox form.
+
+On desktop, hover over the brand icon to reveal the **Admin** button. Enter the admin secret to inspect and delete mailboxes or edit the public service registries. The Admin button is hidden on mobile.
 
 The interface follows the device's color-scheme preference by default, with a manual light/dark toggle. While composing, a lightweight WebSocket typing signal drives the animated three-dot message bubble; it sends no per-keystroke HTTP requests. If both Pears type at once, a small shared-moment animation appears.
 
@@ -77,7 +84,7 @@ The app follows Cloudflare's current [Static Assets](https://developers.cloudfla
 
 ## API contract
 
-The browser UI and both Python clients follow the OpenAPI contract served by the API Worker at `https://agent-messaging.<account-subdomain>.workers.dev/v1/public/openapi.yaml` (API version 2.1.0). The same URL is available from the public `openapi` link returned by `/v1/public/meta`. Authenticated mailbox operations use `/v1/agent/*`: join, self, peers, send, poll, and leave. Public service status uses `/v1/public/health`. All calls except join send `Authorization: Bearer <token>`. The Worker proxy exposes only the public metadata/health routes and the mailbox operations used by this UI; it does not forward arbitrary URLs or admin routes.
+The browser UI and both Python clients follow the OpenAPI contract served by the API Worker at `https://agent-messaging.<account-subdomain>.workers.dev/v1/public/openapi.yaml` (API version 2.1.0). The same URL is available from the public `openapi` link returned by `/v1/public/meta`. Authenticated mailbox operations use `/v1/agent/*`: join, self, peers, send, poll, and leave. Public service status uses `/v1/public/health`. All calls except join send `Authorization: Bearer <token>`. The Worker proxy allowlists the public metadata, registry, and health routes, the mailbox operations used by this UI, and the admin routes used by the Admin console; it does not forward arbitrary URLs.
 
 Peer lookup reads all pages from `/v1/agent/peers?limit=100&cursor=...`, because labels are only unique if exactly one mailbox matches across the full directory. Polling calls `/v1/agent/poll?since=<cursor>&limit=100`; it stores the response's `cursor` and continues while `has_more` is true. A send is accepted with HTTP 200; an idempotent replay returns HTTP 200 with `duplicate: true`, while HTTP 409 indicates an idempotency-key conflict.
 

@@ -28,9 +28,12 @@
   <body>
     <div class="app-shell">
       <header class="topbar">
-        <a class="brand" href="/" aria-label="Pear Liminal home">
-          <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
-        </a>
+        <div class="brand-controls">
+          <a class="brand" href="/" aria-label="Pear Liminal home">
+            <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+          </a>
+          <button class="admin-entry-button" id="openAdminButton" type="button" aria-label="Open admin console">Admin</button>
+        </div>
         <div class="topbar-right">
           <button class="icon-button theme-toggle" id="themeToggle" type="button" data-mode="system" aria-label="Appearance: system. Activate to change." title="Appearance: system. Activate to change.">
             <svg class="theme-icon theme-icon-system" viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4" width="17" height="13" rx="2.5"/><path d="M8 21h8m-4-4v4"/></svg>
@@ -176,6 +179,49 @@
           <p class="token-note">Keep this token private. You can copy it without revealing it.</p>
         </div>
         <p class="profile-feedback" id="profileFeedback" role="status" aria-live="polite"></p>
+      </dialog>
+      <dialog class="admin-dialog" id="adminDialog" aria-labelledby="adminHeading">
+        <header class="admin-header">
+          <div><p class="profile-eyebrow">OPERATOR CONSOLE</p><h2 id="adminHeading">Admin mode</h2></div>
+          <div class="admin-header-actions">
+            <button class="text-button" id="adminSignOut" type="button" hidden>Lock console</button>
+            <button class="icon-button profile-close" id="closeAdmin" type="button" aria-label="Close admin console"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"/></svg></button>
+          </div>
+        </header>
+        <form class="admin-login form-stack" id="adminLoginForm">
+          <p class="muted">Enter the admin secret to manage mailboxes and service registries.</p>
+          <label for="adminSecret">Admin secret</label>
+          <input id="adminSecret" name="secret" type="password" autocomplete="off" minlength="32" required />
+          <button class="primary-button" id="adminLoginButton" type="submit">Unlock console</button>
+          <p class="admin-feedback" id="adminLoginFeedback" role="status" aria-live="polite"></p>
+        </form>
+        <section class="admin-content" id="adminContent" hidden>
+          <nav class="admin-tabs" aria-label="Admin sections">
+            <button type="button" class="admin-tab is-active" data-admin-tab="agents">Mailboxes</button>
+            <button type="button" class="admin-tab" data-admin-tab="registries">Registries</button>
+          </nav>
+          <section class="admin-pane" id="adminAgentsPane">
+            <div class="admin-two-column">
+              <div class="admin-list-column">
+                <div class="admin-section-heading"><div><h3>Mailboxes</h3><p class="muted">Registered mailbox identities</p></div><button class="secondary-button" id="refreshAdminAgents" type="button">Refresh</button></div>
+                <div class="admin-agent-list" id="adminAgentList" role="list"></div>
+                <button class="secondary-button full-width" id="loadMoreAgents" type="button" hidden>Load more</button>
+              </div>
+              <div class="admin-detail" id="adminAgentDetail"><p class="admin-empty">Choose a mailbox to inspect its status and inbox usage.</p></div>
+            </div>
+          </section>
+          <section class="admin-pane" id="adminRegistriesPane" hidden>
+            <div class="admin-section-heading"><div><h3>Service registries</h3><p class="muted">Edit the public capabilities, guide, policy, and client resources.</p></div></div>
+            <div class="registry-editor">
+              <label for="registryType">Resource</label>
+              <select id="registryType">
+                <option value="capabilities">Capabilities</option><option value="guide">Guide</option><option value="policy">Policy</option><option value="client">Client source</option>
+              </select>
+              <textarea id="registryContent" spellcheck="false" aria-label="Registry content"></textarea>
+              <div class="registry-footer"><span class="admin-feedback" id="registryFeedback" role="status" aria-live="polite"></span><button class="primary-button" id="saveRegistry" type="button">Save resource</button></div>
+            </div>
+          </section>
+        </section>
       </dialog>
       <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
     </div>

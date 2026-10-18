@@ -151,6 +151,7 @@ async function api(path, options = {}) {
   const headers = { Accept: "application/json" };
   if (options.body !== undefined) headers["Content-Type"] = "application/json";
   if (options.auth !== false && session?.token) headers.Authorization = `Bearer ${session.token}`;
+  if (options.adminSecret) headers["X-Admin-Secret"] = options.adminSecret;
   if (options.idempotencyKey) headers["Idempotency-Key"] = options.idempotencyKey;
 
   let response;
@@ -990,3 +991,230 @@ async function boot() {
 }
 
 boot();
+
+const adminDialog = $("adminDialog");
+const adminLoginForm = $("adminLoginForm");
+const adminContent = $("adminContent");
+const adminAgentList = $("adminAgentList");
+const adminAgentDetail = $("adminAgentDetail");
+const registryContent = $("registryContent");
+let adminSecret = "";
+let adminAgentsCursor = null;
+let adminRegistries = {};
+
+function adminPath(resource) {
+  return `/v1/admin/registry/${resource}`;
+}
+
+function setAdminFeedback(element, message, isError = false) {
+  element.textContent = message;
+  element.classList.toggle("is-error", isError);
+}
+
+function openAdminConsole() {
+  if (!adminDialog.open) adminDialog.showModal();
+  if (!adminSecret) $("adminSecret").focus();
+}
+
+function lockAdminConsole() {
+  adminSecret = "";
+  adminDialog.classList.remove("is-unlocked");
+  adminAgentsCursor = null;
+  adminRegistries = {};
+  adminLoginForm.hidden = false;
+  adminContent.hidden = true;
+  $("adminSignOut").hidden = true;
+  adminLoginForm.reset();
+  adminAgentList.replaceChildren();
+  adminAgentDetail.innerHTML = '<p class="admin-empty">Choose a mailbox to inspect its status and inbox usage.</p>';
+  setAdminFeedback($("adminLoginFeedback"), "");
+  setAdminFeedback($("registryFeedback"), "");
+}
+
+async function loadAdminAgents(cursor = null, append = false) {
+  const query = new URLSearchParams({ limit: "100" });
+  if (cursor) query.set("cursor", cursor);
+  const page = await api(`/v1/admin/agents?${query}`, { auth: false, adminSecret });
+  if (!append) adminAgentList.replaceChildren();
+  for (const agent of page.agents || []) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "admin-agent-item";
+    item.dataset.mid = agent.mid;
+    const identity = document.createElement("span");
+    identity.className = "admin-agent-identity";
+    const name = document.createElement("strong");
+    name.textContent = agent.label || "Unnamed mailbox";
+    const mid = document.createElement("code");
+    mid.textContent = agent.mid;
+    identity.append(name, mid);
+    const joined = document.createElement("span");
+    joined.className = "admin-agent-date";
+    joined.textContent = new Date(Number(agent.joined_at)).toLocaleDateString();
+    item.append(identity, joined);
+    adminAgentList.append(item);
+  }
+  adminAgentsCursor = page.next_cursor || null;
+  $("loadMoreAgents").hidden = !adminAgentsCursor;
+}
+
+function addAdminDetailRow(parent, label, value) {
+  const row = document.createElement("div");
+  row.className = "admin-detail-row";
+  const key = document.createElement("span");
+  key.textContent = label;
+  const content = document.createElement("strong");
+  content.textContent = String(value);
+  row.append(key, content);
+  parent.append(row);
+}
+
+async function showAdminAgent(mid) {
+  adminAgentDetail.innerHTML = '<p class="admin-empty">Loading mailbox…</p>';
+  try {
+    const agent = await api(`/v1/admin/agents/${encodeURIComponent(mid)}`, { auth: false, adminSecret });
+    const card = document.createElement("div");
+    card.className = "admin-agent-record";
+    const heading = document.createElement("div");
+    heading.className = "admin-section-heading";
+    const identity = document.createElement("div");
+    const name = document.createElement("h3");
+    name.textContent = agent.label || "Unnamed mailbox";
+    const id = document.createElement("code");
+    id.textContent = agent.mid;
+    identity.append(name, id);
+    const status = document.createElement("span");
+    status.className = `admin-status${agent.active ? " is-active" : ""}`;
+    status.textContent = agent.active ? "Active" : "Inactive";
+    heading.append(identity, status);
+    card.append(heading);
+    addAdminDetailRow(card, "Created", new Date(Number(agent.created_at)).toLocaleString());
+    addAdminDetailRow(card, "Inbox messages", Number(agent.message_count || 0).toLocaleString());
+    addAdminDetailRow(card, "Inbox size", `${(Number(agent.message_bytes || 0) / 1024).toFixed(1)} KB`);
+    addAdminDetailRow(card, "Capabilities", (agent.capabilities || []).join(", ") || "None");
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "primary-button admin-delete-button";
+    remove.textContent = "Delete mailbox";
+    remove.addEventListener("click", async () => {
+      if (!confirm(`Delete ${agent.label || agent.mid} and permanently erase its inbox?`)) return;
+      remove.disabled = true;
+      try {
+        await api(`/v1/admin/agents/${encodeURIComponent(agent.mid)}`, { method: "DELETE", auth: false, adminSecret });
+        adminAgentDetail.innerHTML = '<p class="admin-empty">Mailbox deleted and inbox erased.</p>';
+        await loadAdminAgents();
+      } catch (error) {
+        remove.disabled = false;
+        showToast(error.message, true);
+      }
+    });
+    card.append(remove);
+    adminAgentDetail.replaceChildren(card);
+  } catch (error) {
+    adminAgentDetail.innerHTML = "";
+    const message = document.createElement("p");
+    message.className = "admin-empty is-error";
+    message.textContent = error.message;
+    adminAgentDetail.append(message);
+  }
+}
+
+async function loadAdminRegistries() {
+  const [capabilities, guide, policy, client] = await Promise.all([
+    api("/v1/public/capabilities", { auth: false }),
+    api("/v1/public/guide", { auth: false }),
+    api("/v1/public/policy", { auth: false }),
+    api("/v1/public/client", { auth: false }).catch((error) => {
+      if (error.status === 404) return "";
+      throw error;
+    }),
+  ]);
+  adminRegistries = {
+    capabilities: JSON.stringify(capabilities.capabilities || [], null, 2),
+    guide,
+    policy,
+    client,
+  };
+  showRegistryEditor();
+}
+
+function showRegistryEditor() {
+  registryContent.value = adminRegistries[$("registryType").value] || "";
+  setAdminFeedback($("registryFeedback"), "");
+}
+
+$("openAdminButton").addEventListener("click", openAdminConsole);
+
+adminLoginForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const secret = String(new FormData(adminLoginForm).get("secret") || "").trim();
+  const button = $("adminLoginButton");
+  button.disabled = true;
+  setAdminFeedback($("adminLoginFeedback"), "Checking admin secret…");
+  try {
+    adminSecret = secret;
+    await loadAdminAgents();
+    await loadAdminRegistries();
+    adminLoginForm.reset();
+    adminLoginForm.hidden = true;
+    adminDialog.classList.add("is-unlocked");
+    adminContent.hidden = false;
+    $("adminSignOut").hidden = false;
+    $("adminAgentsPane").hidden = false;
+    $("adminRegistriesPane").hidden = true;
+    document.querySelectorAll(".admin-tab").forEach((tab) => tab.classList.toggle("is-active", tab.dataset.adminTab === "agents"));
+  } catch (error) {
+    adminSecret = "";
+    setAdminFeedback($("adminLoginFeedback"), error.status === 401 ? "The admin secret was not accepted." : error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+adminAgentList.addEventListener("click", (event) => {
+  const item = event.target.closest("[data-mid]");
+  if (item) showAdminAgent(item.dataset.mid);
+});
+$("refreshAdminAgents").addEventListener("click", () => loadAdminAgents().catch((error) => showToast(error.message, true)));
+$("loadMoreAgents").addEventListener("click", () => loadAdminAgents(adminAgentsCursor, true).catch((error) => showToast(error.message, true)));
+document.querySelectorAll(".admin-tab").forEach((tab) => tab.addEventListener("click", () => {
+  const agents = tab.dataset.adminTab === "agents";
+  $("adminAgentsPane").hidden = !agents;
+  $("adminRegistriesPane").hidden = agents;
+  document.querySelectorAll(".admin-tab").forEach((candidate) => candidate.classList.toggle("is-active", candidate === tab));
+}));
+$("registryType").addEventListener("change", showRegistryEditor);
+$("saveRegistry").addEventListener("click", async () => {
+  const resource = $("registryType").value;
+  let body;
+  if (resource === "capabilities") {
+    try {
+      body = { capabilities: JSON.parse(registryContent.value) };
+      if (!Array.isArray(body.capabilities)) throw new Error("Capabilities must be a JSON array.");
+    } catch (error) {
+      setAdminFeedback($("registryFeedback"), error.message || "Enter valid JSON.", true);
+      return;
+    }
+  } else {
+    body = { [resource === "client" ? "source" : "markdown"]: registryContent.value };
+  }
+  const button = $("saveRegistry");
+  button.disabled = true;
+  setAdminFeedback($("registryFeedback"), "Saving…");
+  try {
+    const result = await api(adminPath(resource), { method: "POST", body, auth: false, adminSecret });
+    adminRegistries[resource] = registryContent.value;
+    setAdminFeedback($("registryFeedback"), `Saved${result.version ? ` · version ${result.version}` : ""}.`);
+  } catch (error) {
+    setAdminFeedback($("registryFeedback"), error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$("adminSignOut").addEventListener("click", lockAdminConsole);
+$("closeAdmin").addEventListener("click", () => adminDialog.close());
+adminDialog.addEventListener("close", lockAdminConsole);
+adminDialog.addEventListener("click", (event) => {
+  if (event.target === adminDialog) adminDialog.close();
+});
