@@ -46,7 +46,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-BASE = os.environ.get("AGENT_MESSAGING_BASE", "https://agent-messaging.charcoal.workers.dev")
+BASE = os.environ.get("AGENT_MESSAGING_BASE", "https://agent-messaging.your-account.workers.dev")
 CONTROL = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|[\x00-\x08\x0b-\x1f\x7f]")
 AGREED = re.compile(r"^\**\s*Agreed so far:?\**:?\s*$", re.IGNORECASE | re.MULTILINE)
 WRAP = "[WRAP]"
@@ -107,7 +107,7 @@ class Mailbox:
         if not secret:
             sys.exit("not joined and JOIN_SECRET is not set")
         body = {"join_secret": secret, "label": label, "capabilities": capabilities}
-        status, r = self.req("POST", "/v1/join", body, auth=False)
+        status, r = self.req("POST", "/v1/agent/join", body, auth=False)
         if status not in (200, 201):
             sys.exit(f"join failed ({status}): {r}")
         self.state = {"base": BASE, "mid": r["mid"], "label": label,
@@ -115,15 +115,31 @@ class Mailbox:
         self.save()
 
     def leave(self):
-        return self.req("POST", "/v1/leave", {})
+        return self.req("POST", "/v1/agent/leave")
 
     def find_peer(self, label, wait):
         """Resolve a label to a mailbox id. Refuses ambiguous labels (labels aren't unique)."""
         deadline = time.time() + wait
         while time.time() < deadline:
-            status, r = self.req("GET", "/v1/peers?limit=100")
+            peers = []
+            cursor = None
+            seen_cursors = set()
+            while True:
+                params = {"limit": 100}
+                if cursor:
+                    if cursor in seen_cursors:
+                        sys.exit("peer listing returned a repeated cursor")
+                    seen_cursors.add(cursor)
+                    params["cursor"] = cursor
+                status, r = self.req("GET", "/v1/agent/peers?" + urllib.parse.urlencode(params))
+                if status != 200:
+                    break
+                peers.extend(r["peers"])
+                cursor = r.get("next_cursor")
+                if not cursor:
+                    break
             if status == 200:
-                hits = [p["mid"] for p in r["peers"] if p.get("label") == label]
+                hits = [p["mid"] for p in peers if p.get("label") == label]
                 if len(hits) == 1:
                     return hits[0]
                 if len(hits) > 1:
@@ -133,16 +149,15 @@ class Mailbox:
 
     def send(self, to, payload, key, attempts=6):
         for attempt in range(attempts):
-            status, r = self.req("POST", "/v1/send", {"to": to, "payload": payload},
+            status, r = self.req("POST", "/v1/agent/send", {"to": to, "payload": payload},
                                  {"Idempotency-Key": key})
             if status in (200, 201):
                 return r
-            if status == 409:            # this key was already sent (e.g. before a crash)
-                log("send", f"{key} was already delivered; not sending a duplicate")
-                return {"duplicate": True}
             if status in (429, 503) or status >= 500:
                 time.sleep(min(60, 2 ** attempt))
                 continue
+            if status == 409:
+                sys.exit(f"send failed ({status}): idempotency key was reused with a different request: {r}")
             sys.exit(f"send failed ({status}): {r}")
         sys.exit(f"send failed after {attempts} attempts (peer inbox full or bus down)")
 
@@ -150,14 +165,13 @@ class Mailbox:
         out = []
         while True:
             q = urllib.parse.urlencode({"since": self.state.get("cursor", "0"), "limit": 100})
-            status, r = self.req("GET", "/v1/poll?" + q)
+            status, r = self.req("GET", "/v1/agent/poll?" + q)
             if status != 200:
                 log("poll", f"error {status}: {r}")
                 return out
             out.extend(r["messages"])
-            if r["messages"]:
-                self.state["cursor"] = r["messages"][-1]["id"]
-                self.save()
+            self.state["cursor"] = r["cursor"]
+            self.save()
             if not r.get("has_more") or not r["messages"]:
                 return out
 

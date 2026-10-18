@@ -40,7 +40,7 @@ try:
 except ImportError:
     readline = None
 
-BASE = os.environ.get("AGENT_MESSAGING_BASE", "https://agent-messaging.charcoal.workers.dev")
+BASE = os.environ.get("AGENT_MESSAGING_BASE", "https://agent-messaging.your-account.workers.dev")
 CONTROL = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|[\x00-\x08\x0b-\x1f\x7f]")
 TYPES = {"msg", "final", "done", "abort"}
 PROMPT = "you> "
@@ -83,7 +83,7 @@ class Mailbox:
         secret = os.environ.get("JOIN_SECRET")
         if not secret:
             sys.exit("not joined and JOIN_SECRET is not set")
-        status, r = self.req("POST", "/v1/join", {"join_secret": secret, "label": label}, auth=False)
+        status, r = self.req("POST", "/v1/agent/join", {"join_secret": secret, "label": label}, auth=False)
         if status not in (200, 201):
             sys.exit(f"join failed ({status}): {r}")
         self.state = {"mid": r["mid"], "token": r["token"], "label": label}
@@ -92,9 +92,25 @@ class Mailbox:
     def find_peer(self, label, wait):
         deadline = time.time() + wait
         while time.time() < deadline:
-            status, r = self.req("GET", "/v1/peers?limit=100")
+            peers = []
+            cursor = None
+            seen_cursors = set()
+            while True:
+                params = {"limit": 100}
+                if cursor:
+                    if cursor in seen_cursors:
+                        sys.exit("peer listing returned a repeated cursor")
+                    seen_cursors.add(cursor)
+                    params["cursor"] = cursor
+                status, r = self.req("GET", "/v1/agent/peers?" + urllib.parse.urlencode(params))
+                if status != 200:
+                    break
+                peers.extend(r["peers"])
+                cursor = r.get("next_cursor")
+                if not cursor:
+                    break
             if status == 200:
-                hits = [p["mid"] for p in r["peers"] if p.get("label") == label]
+                hits = [p["mid"] for p in peers if p.get("label") == label]
                 if len(hits) == 1:
                     return hits[0]
                 if len(hits) > 1:
@@ -104,13 +120,16 @@ class Mailbox:
 
     def send(self, to, payload, key):
         for attempt in range(6):
-            status, r = self.req("POST", "/v1/send", {"to": to, "payload": payload},
+            status, r = self.req("POST", "/v1/agent/send", {"to": to, "payload": payload},
                                  {"Idempotency-Key": key})
-            if status in (200, 201) or status == 409:   # 409: already delivered
+            if status == 200:   # idempotent retries return the original id with duplicate=true
                 return True
             if status in (429, 503) or status >= 500:
                 time.sleep(min(30, 2 ** attempt))
                 continue
+            if status == 409:
+                print(f"\n[send failed ({status}): idempotency key was reused with a different request: {r}]")
+                return False
             print(f"\n[send failed ({status}): {r}]")
             return False
         print("\n[send failed: bus unreachable or agent inbox full]")
@@ -120,13 +139,12 @@ class Mailbox:
         out = []
         while True:
             q = urllib.parse.urlencode({"since": self.state.get("cursor", "0"), "limit": 100})
-            status, r = self.req("GET", "/v1/poll?" + q)
+            status, r = self.req("GET", "/v1/agent/poll?" + q)
             if status != 200:
                 return out
             out.extend(r["messages"])
-            if r["messages"]:
-                self.state["cursor"] = r["messages"][-1]["id"]
-                self.save()
+            self.state["cursor"] = r["cursor"]
+            self.save()
             if not r.get("has_more") or not r["messages"]:
                 return out
 
@@ -160,12 +178,17 @@ class Chat:
         self.transcript = os.path.join(a.out, f"{a.label}-transcript.md")
         self.over = threading.Event()    # set when the agent sends done/abort
         self.pending = 0                 # messages sent and not yet answered
+        self.input_active = False
         print(f"[connected to {self.name} = {self.peer}; thread {s['thread']}; /help for commands]")
 
     # -- output ------------------------------------------------------------
     def show(self, text):
         """Print above the input line without clobbering what the user is typing."""
-        buf = readline.get_line_buffer() if readline else ""
+        # A poll thread cannot reliably call readline.redisplay(). Reprint the
+        # current prompt ourselves, but only reuse the buffer while input() is
+        # actually waiting; GNU readline can retain the previous submitted line
+        # briefly after input() returns.
+        buf = readline.get_line_buffer() if readline and self.input_active else ""
         sys.stdout.write("\r\x1b[2K" + text + "\n" + PROMPT + buf)
         sys.stdout.flush()
 
@@ -214,11 +237,15 @@ class Chat:
 
     # -- input -------------------------------------------------------------
     def read_message(self):
-        lines = [input(PROMPT)]
-        while lines[-1].endswith("\\"):
-            lines[-1] = lines[-1][:-1]
-            lines.append(input("...  "))
-        return "\n".join(lines).strip()
+        self.input_active = True
+        try:
+            lines = [input(PROMPT)]
+            while lines[-1].endswith("\\"):
+                lines[-1] = lines[-1][:-1]
+                lines.append(input("...  "))
+            return "\n".join(lines).strip()
+        finally:
+            self.input_active = False
 
     def run(self):
         threading.Thread(target=self.poll_loop, daemon=True).start()
@@ -273,7 +300,7 @@ def main():
         print("\n[interrupted; the agent was not told. Rerun with the same --state to continue]")
         return
     if a.leave_on_exit:
-        print(f"[leave: {chat.mb.req('POST', '/v1/leave', {})}]")
+        print(f"[leave: {chat.mb.req('POST', '/v1/agent/leave')}]")
 
 
 if __name__ == "__main__":

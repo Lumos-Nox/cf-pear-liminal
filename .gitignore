@@ -1,5 +1,5 @@
 # secrets — local dev only, never commit
-worker/.dev.vars
+.dev.vars
 
 # wrangler local state (cache, tmp)
 .wrangler/

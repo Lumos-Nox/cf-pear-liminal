@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f4f6f8" />
+    <meta name="description" content="A simple browser chat for agent-messaging mailboxes." />
+    <title>Agent Comm</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="Agent Comm home">
+          <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+          <span class="brand-copy"><strong>Agent Comm</strong><small>Private mailbox chat</small></span>
+        </a>
+        <div class="topbar-right">
+          <span class="service-state" id="serviceState"><i></i><span>Checking service</span></span>
+          <span class="connection-state" id="connectionState" hidden><i></i><span>Disconnected</span></span>
+          <button class="icon-button mobile-menu" id="mobileMenu" type="button" aria-label="Open contacts" aria-expanded="false">☰</button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <aside class="sidebar" id="sidebar">
+          <section class="connect-card" id="connectCard">
+            <div class="section-kicker">GET STARTED</div>
+            <h1>Your agent inbox</h1>
+            <p class="muted">Join the message bus or reconnect to a mailbox you already own.</p>
+
+            <form id="joinForm" class="form-stack">
+              <label for="joinLabel">Your name</label>
+              <input id="joinLabel" name="label" autocomplete="nickname" maxlength="64" placeholder="e.g. Alice" required />
+              <label for="joinSecret">Join secret</label>
+              <input id="joinSecret" name="join_secret" type="password" autocomplete="off" minlength="32" placeholder="At least 32 characters" required />
+              <button class="primary-button full-width" id="joinButton" type="submit">Create mailbox <span aria-hidden="true">→</span></button>
+            </form>
+            <p class="fine-print">Your join secret is used once and never saved by this app.</p>
+
+            <details class="resume-box">
+              <summary>Already have a bearer token?</summary>
+              <form id="resumeForm" class="form-stack compact-stack">
+                <label for="resumeToken">Mailbox bearer token</label>
+                <input id="resumeToken" name="token" type="password" autocomplete="off" placeholder="m-… .secret" required />
+                <button class="secondary-button full-width" id="resumeButton" type="submit">Reconnect mailbox</button>
+              </form>
+            </details>
+            <div class="security-note"><span aria-hidden="true">⌑</span><span>Messages are stored on the bus. Don’t send secrets or sensitive information.</span></div>
+          </section>
+
+          <section class="mailbox-card" id="mailboxCard" hidden>
+            <div class="section-kicker">YOUR MAILBOX</div>
+            <div class="identity-row">
+              <div class="avatar avatar-self" id="selfAvatar">A</div>
+              <div class="identity-copy"><strong id="selfLabel">—</strong><span id="selfMid">—</span></div>
+              <button class="icon-button" id="copyMid" type="button" aria-label="Copy mailbox ID" title="Copy mailbox ID">⧉</button>
+            </div>
+            <div class="mailbox-actions">
+              <button class="text-button" id="localSignOut" type="button">Sign out</button>
+              <button class="text-button danger-text" id="leaveMailbox" type="button">Delete mailbox</button>
+            </div>
+          </section>
+
+          <section class="contacts-card" id="contactsCard" hidden>
+            <div class="contacts-heading">
+              <div><div class="section-kicker">DIRECTORY</div><h2>People</h2></div>
+              <button class="icon-button" id="refreshPeers" type="button" aria-label="Refresh people" title="Refresh people">↻</button>
+            </div>
+            <div class="search-wrap"><span aria-hidden="true">⌕</span><input id="peerSearch" type="search" placeholder="Find a mailbox" aria-label="Find a mailbox" /></div>
+            <div class="peer-list" id="peerList" role="list"></div>
+            <p class="empty-directory" id="emptyDirectory" hidden>No other mailboxes yet. Keep this open while your peer joins.</p>
+            <p class="directory-foot"><span id="peerCount">0 people</span><span>Names may repeat</span></p>
+          </section>
+          <footer class="sidebar-footer">Agent Messaging API <span>v2.1</span></footer>
+        </aside>
+
+        <section class="chat-area" aria-label="Conversation">
+          <div class="welcome-panel" id="welcomePanel">
+            <div class="welcome-art" aria-hidden="true">
+              <div class="orbit orbit-one"></div><div class="orbit orbit-two"></div>
+              <div class="art-core"><span></span><span></span><span></span></div>
+              <div class="art-dot dot-one"></div><div class="art-dot dot-two"></div><div class="art-dot dot-three"></div>
+            </div>
+            <div class="section-kicker">A QUIETER WAY TO CONNECT</div>
+            <h2>Conversations between<br />people and agents.</h2>
+            <p>Choose a mailbox from the directory to start a private, asynchronous conversation.</p>
+            <div class="welcome-hints"><span><b>01</b> Join your mailbox</span><span><b>02</b> Pick a person</span><span><b>03</b> Start talking</span></div>
+          </div>
+
+          <div class="conversation" id="conversation" hidden>
+            <header class="chat-header">
+              <div class="chat-peer">
+                <div class="avatar avatar-peer" id="chatAvatar">?</div>
+                <div><h2 id="chatPeerName">Mailbox</h2><p id="chatPeerMid">—</p></div>
+              </div>
+              <div class="chat-tools">
+                <span class="thread-chip" id="threadStatus"><i></i> Waiting for messages</span>
+                <button class="secondary-button summary-button" id="summaryButton" type="button" title="Ask the agent to wrap up and send a summary">Ask for summary</button>
+                <button class="icon-button" id="finishChat" type="button" aria-label="End this conversation" title="End conversation">↗</button>
+              </div>
+            </header>
+            <div class="message-scroller" id="messageScroller">
+              <div class="thread-start" id="threadStart"><span class="thread-start-icon">✳</span><strong>This is the beginning.</strong><span>Say hello to start the conversation.</span></div>
+              <div class="message-list" id="messageList" aria-live="polite" aria-relevant="additions text"></div>
+            </div>
+            <form class="composer" id="composerForm">
+              <label class="sr-only" for="messageInput">Write a message</label>
+              <textarea id="messageInput" rows="1" maxlength="8000" placeholder="Write a message…" disabled></textarea>
+              <div class="composer-bottom">
+                <span>Enter to send <kbd>Shift</kbd> + <kbd>Enter</kbd> for a new line</span>
+                <button class="send-button" id="sendButton" type="submit" disabled><span>Send</span><b aria-hidden="true">↑</b></button>
+              </div>
+            </form>
+          </div>
+        </section>
+      </main>
+      <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+    </div>
+  </body>
+</html>

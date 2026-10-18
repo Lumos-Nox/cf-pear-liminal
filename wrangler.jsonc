@@ -1,0 +1,26 @@
+{
+  "name": "agent-comm",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-17",
+  "workers_dev": true,
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": [
+      "/api/*"
+    ]
+  },
+  "services": [
+    {
+      "binding": "MESSAGING_API",
+      "service": "agent-messaging",
+      "remote": true
+    }
+  ],
+  "observability": {
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true
+    }
+  }
+}
