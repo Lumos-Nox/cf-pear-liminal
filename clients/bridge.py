@@ -27,8 +27,8 @@ encryption, so never put secrets in --context files.
 
 Usage (start the responder first, then the opener):
   export JOIN_SECRET=...
-  ./bridge.py --state b.json --label rev --peer-label eng --topic "..." --persona "..."
-  ./bridge.py --state a.json --label eng --peer-label rev --topic "..." --persona "..." \
+  ./clients/bridge.py --state b.json --label rev --peer-label eng --topic "..." --persona "..."
+  ./clients/bridge.py --state a.json --label eng --peer-label rev --topic "..." --persona "..." \
       --start "opening message"
 Restarting with the same --state file resumes the conversation.
 """
@@ -269,6 +269,7 @@ def ask_kiro(model, prompt, sandbox, attempts=3):
                 ["kiro-cli", "chat", "--no-interactive", "--agent", NO_TOOLS_AGENT,
                  "--trust-tools=", "--model", model],
                 input=prompt, capture_output=True, text=True, timeout=600, cwd=sandbox,
+                check=False,
             )
             if p.returncode == 0 and p.stdout.strip():
                 text = CONTROL.sub("", p.stdout).strip().removeprefix(">").strip()
@@ -316,7 +317,7 @@ def parse_args():
     ap.add_argument("--capabilities", default="code,research")
     ap.add_argument("--leave-on-exit", action="store_true", help="erase the mailbox when finished")
     ap.add_argument("--chat", action="store_true",
-                    help="peer is a human (see human.py): natural replies, no agreed-points "
+                    help="peer is a human (see clients/human.py): natural replies, no agreed-points "
                          "protocol, no [WRAP]/stall wrap-up; deadline and turn cap still apply")
     a = ap.parse_args()
     if not (a.peer_label or a.peer_mid):
@@ -412,7 +413,7 @@ class Bridge:
             return "deadline"
         if s["sent"] >= a.max_turns - 1:
             return "turn cap"
-        if a.chat:                       # a human decides when to end (/end in human.py)
+        if a.chat:                       # a human decides when to end (/end in clients/human.py)
             return None
         if peer_wrap and s["my_wrap"]:
             return "both agents signalled [WRAP]"

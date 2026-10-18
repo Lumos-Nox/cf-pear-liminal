@@ -20,6 +20,44 @@ const ALLOWED_QUERY = {
 };
 const MAX_REQUEST_BYTES = 128 * 1024;
 const UPSTREAM_TIMEOUT_MS = 12_000;
+const MAILBOX_ID_PATTERN = /^m-[0-9a-f]{32}$/;
+
+async function createPresenceTicket(request, env) {
+  const authorization = request.headers.get("authorization");
+  if (!authorization?.startsWith("Bearer ")) return json({ error: "unauthorized" }, 401);
+
+  let identity;
+  try {
+    const response = await env.MESSAGING_API.fetch(new Request("https://agent-messaging/v1/agent/self", {
+      headers: { authorization },
+    }));
+    if (!response.ok) return json({ error: response.status === 401 ? "unauthorized" : "identity unavailable" }, response.status);
+    identity = await response.json();
+  } catch {
+    return json({ error: "identity unavailable" }, 502);
+  }
+
+  if (typeof identity.mid !== "string" || !MAILBOX_ID_PATTERN.test(identity.mid)) return json({ error: "invalid identity" }, 502);
+  const id = env.TYPING_PRESENCE.idFromName(identity.mid);
+  const stub = env.TYPING_PRESENCE.get(id);
+  const ticketResponse = await stub.fetch("https://typing.internal/ticket", { method: "POST" });
+  if (!ticketResponse.ok) return json({ error: "presence unavailable" }, 503);
+  const { ticket } = await ticketResponse.json();
+  return json({ mid: identity.mid, ticket }, 200);
+}
+
+async function routePresenceSocket(request, env, url) {
+  if (request.method !== "GET" || request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+    return json({ error: "websocket upgrade required" }, 426);
+  }
+  const mid = url.searchParams.get("mid");
+  const ticket = url.searchParams.get("ticket");
+  if (!mid || !MAILBOX_ID_PATTERN.test(mid) || !ticket || ticket.length > 100) return json({ error: "invalid ticket" }, 401);
+  const id = env.TYPING_PRESENCE.idFromName(mid);
+  const stub = env.TYPING_PRESENCE.get(id);
+  const headers = new Headers({ Upgrade: "websocket", "x-presence-mid": mid, "x-presence-ticket": ticket });
+  return stub.fetch(new Request("https://typing.internal/connect", { method: "GET", headers }));
+}
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -139,7 +177,104 @@ async function proxyApi(request, env, url) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    if (url.pathname === "/api/presence-ticket") {
+      if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
+      return createPresenceTicket(request, env);
+    }
+    if (url.pathname === "/presence") return routePresenceSocket(request, env, url);
     if (url.pathname.startsWith("/api/")) return proxyApi(request, env, url);
     return env.ASSETS.fetch(request);
   },
 };
+
+export class TypingPresence {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname === "/ticket" && request.method === "POST") {
+      const now = Date.now();
+      const tickets = await this.state.storage.list({ prefix: "ticket:" });
+      let outstanding = 0;
+      for (const [key, expiresAt] of tickets) {
+        if (typeof expiresAt !== "number" || expiresAt < now) await this.state.storage.delete(key);
+        else outstanding += 1;
+      }
+      if (outstanding >= 5) return json({ error: "too many pending tickets" }, 429);
+      const ticket = crypto.randomUUID();
+      await this.state.storage.put(`ticket:${ticket}`, now + 30_000);
+      return json({ ticket });
+    }
+
+    if (url.pathname === "/connect" && request.method === "GET") {
+      const mid = request.headers.get("x-presence-mid");
+      const ticket = request.headers.get("x-presence-ticket");
+      if (!mid || !ticket) return json({ error: "invalid ticket" }, 401);
+      const expiresAt = await this.state.storage.get(`ticket:${ticket}`);
+      await this.state.storage.delete(`ticket:${ticket}`);
+      if (typeof expiresAt !== "number" || expiresAt < Date.now()) return json({ error: "expired ticket" }, 401);
+
+      const pair = new WebSocketPair();
+      const client = pair[0];
+      const server = pair[1];
+      server.serializeAttachment({ mid, peer: null, typing: false, lastSignalAt: 0 });
+      this.state.acceptWebSocket(server);
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    if (url.pathname === "/event" && request.method === "POST") {
+      let event;
+      try { event = await request.json(); } catch { return json({ error: "invalid event" }, 400); }
+      if (typeof event.from !== "string" || !MAILBOX_ID_PATTERN.test(event.from) || typeof event.active !== "boolean") return json({ error: "invalid event" }, 400);
+      for (const socket of this.state.getWebSockets()) {
+        const attachment = socket.deserializeAttachment();
+        if (attachment?.peer !== event.from) continue;
+        try { socket.send(JSON.stringify({ type: "typing", from: event.from, active: event.active })); } catch {}
+      }
+      return json({ ok: true });
+    }
+    return json({ error: "not found" }, 404);
+  }
+
+  async webSocketMessage(socket, message) {
+    if (typeof message !== "string" || message.length > 512) return;
+    let event;
+    try { event = JSON.parse(message); } catch { return; }
+    const attachment = socket.deserializeAttachment();
+    if (!attachment?.mid) return;
+
+    if (event.type === "watch" && (event.peer === null || (typeof event.peer === "string" && MAILBOX_ID_PATTERN.test(event.peer)))) {
+      if (attachment.typing && attachment.peer && attachment.peer !== event.peer) {
+        await this.forwardTyping(attachment.peer, attachment.mid, false);
+      }
+      socket.serializeAttachment({ ...attachment, peer: event.peer, typing: false, lastSignalAt: 0 });
+      return;
+    }
+    if (event.type !== "typing" || typeof event.active !== "boolean" || !attachment.peer) return;
+
+    const now = Date.now();
+    if (now - attachment.lastSignalAt < 750) return;
+    if (event.active && attachment.typing && now - attachment.lastSignalAt < 5_000) return;
+    if (event.active === attachment.typing && event.active === false) return;
+    socket.serializeAttachment({ ...attachment, typing: event.active, lastSignalAt: now });
+    await this.forwardTyping(attachment.peer, attachment.mid, event.active);
+  }
+
+  async webSocketClose(socket) {
+    const attachment = socket.deserializeAttachment();
+    if (!attachment?.typing || !attachment.peer) return;
+    await this.forwardTyping(attachment.peer, attachment.mid, false);
+  }
+
+  async forwardTyping(recipient, from, active) {
+    const recipientId = this.env.TYPING_PRESENCE.idFromName(recipient);
+    await this.env.TYPING_PRESENCE.get(recipientId).fetch("https://typing.internal/event", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ from, active }),
+    });
+  }
+}

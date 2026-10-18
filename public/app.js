@@ -1,17 +1,32 @@
 const STORAGE_KEY = "agent-comm.session.v1";
+const TOKEN_ACCESS_PREFIX = `${STORAGE_KEY}.token-access.`;
+const THEME_STORAGE_KEY = "agent-comm.theme";
 const POLL_INTERVAL_MS = 3000;
+const TYPING_IDLE_MS = 1200;
+const TYPING_HEARTBEAT_MS = 6000;
+const TYPING_VISIBLE_MS = 9000;
 const MESSAGE_TYPES = new Set(["msg", "final", "done", "abort"]);
 
 const $ = (id) => document.getElementById(id);
 const ui = {
   serviceState: $("serviceState"),
+  themeToggle: $("themeToggle"),
   connectionState: $("connectionState"),
   connectCard: $("connectCard"),
   mailboxCard: $("mailboxCard"),
   contactsCard: $("contactsCard"),
   selfLabel: $("selfLabel"),
-  selfMid: $("selfMid"),
   selfAvatar: $("selfAvatar"),
+  profileAvatar: $("profileAvatar"),
+  profileName: $("profileName"),
+  profileMid: $("profileMid"),
+  profileDialog: $("profileDialog"),
+  bearerTokenValue: $("bearerTokenValue"),
+  tokenNote: document.querySelector(".token-note"),
+  profileFeedback: $("profileFeedback"),
+  revealToken: $("revealToken"),
+  copyBearerToken: $("copyBearerToken"),
+  closeProfile: $("closeProfile"),
   peerList: $("peerList"),
   peerCount: $("peerCount"),
   peerSearch: $("peerSearch"),
@@ -21,6 +36,8 @@ const ui = {
   chatAvatar: $("chatAvatar"),
   chatPeerName: $("chatPeerName"),
   chatPeerMid: $("chatPeerMid"),
+  typingIndicator: $("typingIndicator"),
+  localTypingBubble: $("localTypingBubble"),
   threadStatus: $("threadStatus"),
   messageScroller: $("messageScroller"),
   threadStart: $("threadStart"),
@@ -33,7 +50,32 @@ const ui = {
   toast: $("toast"),
   sidebar: $("sidebar"),
   mobileMenu: $("mobileMenu"),
+  sidebarScrim: $("sidebarScrim"),
+  welcomeAction: $("welcomeAction"),
+  welcomeActionLabel: $("welcomeActionLabel"),
 };
+
+const systemTheme = window.matchMedia("(prefers-color-scheme: dark)");
+let themePreference = document.documentElement.dataset.themePreference || "system";
+
+function applyThemePreference() {
+  const mode = themePreference === "system"
+    ? (systemTheme.matches ? "dark" : "light")
+    : themePreference;
+  document.documentElement.dataset.theme = mode;
+  document.documentElement.dataset.themePreference = themePreference;
+  ui.themeToggle.dataset.mode = themePreference;
+
+  const appearance = themePreference === "system" ? `system (${mode})` : themePreference;
+  const next = themePreference === "system" ? (mode === "dark" ? "light" : "dark") : "system";
+  const label = `Appearance: ${appearance}. Activate to ${themePreference === "system" ? `use ${next}` : "follow system"}.`;
+  ui.themeToggle.setAttribute("aria-label", label);
+  ui.themeToggle.title = label;
+  const themeColor = $("themeColor");
+  if (themeColor) themeColor.content = mode === "dark" ? "#151a17" : "#ffffff";
+}
+
+applyThemePreference();
 
 let session = readSession();
 let self = null;
@@ -45,6 +87,18 @@ let pollInFlight = false;
 let sending = false;
 let toastTimer = null;
 let sessionGeneration = 0;
+let typingSocket = null;
+let typingReconnectTimer = null;
+let typingReconnectAttempt = 0;
+let typingHeartbeatTimer = null;
+let typingStopTimer = null;
+let localTypingTimer = null;
+let sharedMomentTimer = null;
+let remoteTypingTimer = null;
+let typingActive = false;
+let localTypingVisible = false;
+let sharedMomentActive = false;
+let remoteTypingMid = null;
 
 function readSession() {
   try {
@@ -52,6 +106,10 @@ function readSession() {
     if (!saved || typeof saved.token !== "string" || typeof saved.mid !== "string") return null;
     saved.cursor = String(saved.cursor || "0");
     saved.handled = Array.isArray(saved.handled) ? saved.handled : [];
+    saved.tokenRevealUsed = Boolean(saved.tokenRevealUsed);
+    saved.tokenCopyUsed = Boolean(saved.tokenCopyUsed);
+    saved.tokenCopyWindowOpen = false;
+    if (sessionStorage.getItem(`${TOKEN_ACCESS_PREFIX}${saved.mid}`) === "used") saved.tokenRevealUsed = true;
     saved.conversations = saved.conversations && typeof saved.conversations === "object"
       ? saved.conversations : {};
     return saved;
@@ -67,6 +125,7 @@ function saveSession() {
 
 function clearSession() {
   sessionGeneration += 1;
+  closeTypingSocket();
   sessionStorage.removeItem(STORAGE_KEY);
   session = null;
   self = null;
@@ -135,10 +194,13 @@ function setConnected(connected) {
   ui.mailboxCard.hidden = !connected;
   ui.contactsCard.hidden = !connected;
   ui.connectionState.hidden = !connected;
+  ui.mobileMenu.setAttribute("aria-label", connected ? "Open Pears" : "Open mailbox setup");
   if (connected && self) {
     ui.selfLabel.textContent = self.label || "Your mailbox";
-    ui.selfMid.textContent = self.mid;
     ui.selfAvatar.textContent = avatarLetter(self.label);
+    ui.profileAvatar.textContent = avatarLetter(self.label);
+    ui.profileName.textContent = self.label || "Your mailbox";
+    ui.profileMid.textContent = self.mid;
   }
   renderPeers();
   renderConversation();
@@ -154,6 +216,12 @@ function showToast(message, isError = false) {
 
 function avatarLetter(label) {
   return (label || "?").trim().slice(0, 1).toLocaleUpperCase() || "?";
+}
+
+function avatarTone(id) {
+  let hash = 0;
+  for (const character of id || "") hash = (hash * 31 + character.charCodeAt(0)) >>> 0;
+  return hash % 6;
 }
 
 function shortMid(mid) {
@@ -204,7 +272,7 @@ function appendMessage(conversation, message) {
 function renderPeers() {
   if (!session) {
     ui.peerList.replaceChildren();
-    ui.peerCount.textContent = "0 people";
+    ui.peerCount.textContent = "0 Pears";
     ui.emptyDirectory.hidden = true;
     return;
   }
@@ -220,7 +288,7 @@ function renderPeers() {
     button.addEventListener("click", () => selectPeer(peer.mid));
 
     const avatar = document.createElement("span");
-    avatar.className = "avatar peer-avatar";
+    avatar.className = `avatar peer-avatar peer-avatar-tone-${avatarTone(peer.mid)}`;
     avatar.textContent = avatarLetter(peer.label);
     const copy = document.createElement("span");
     copy.className = "peer-copy";
@@ -230,38 +298,88 @@ function renderPeers() {
     mid.textContent = shortMid(peer.mid);
     copy.append(label, mid);
     button.append(avatar, copy);
+    const unreadCount = conversation.unread;
+    const peerName = peer.label || "Unnamed mailbox";
+    button.setAttribute("aria-label", `${peerName}, ${shortMid(peer.mid)}${unreadCount > 0 ? `, ${unreadCount} unread ${unreadCount === 1 ? "message" : "messages"}` : ""}`);
+    if (peer.mid === activePeerMid) button.setAttribute("aria-current", "true");
     if (conversation.unread > 0) {
       const unread = document.createElement("span");
       unread.className = "unread-badge";
       unread.textContent = conversation.unread > 99 ? "99+" : String(conversation.unread);
+      unread.setAttribute("aria-hidden", "true");
       button.append(unread);
     }
     ui.peerList.append(button);
   }
-  ui.peerCount.textContent = `${peers.length} ${peers.length === 1 ? "person" : "people"}`;
+  ui.peerCount.textContent = `${peers.length} ${peers.length === 1 ? "Pear" : "Pears"}`;
   ui.emptyDirectory.hidden = visible.length !== 0;
   if (peers.length === 0) {
-    ui.emptyDirectory.textContent = "No other mailboxes yet. Keep this open while your peer joins.";
+    ui.emptyDirectory.textContent = "No other Pears yet. Keep this open while someone joins.";
   } else if (visible.length === 0) {
-    ui.emptyDirectory.textContent = `No mailboxes match “${ui.peerSearch.value.trim()}”.`;
+    ui.emptyDirectory.textContent = `No Pears match “${ui.peerSearch.value.trim()}”.`;
   }
 }
 
 function selectPeer(mid) {
+  stopTyping();
   activePeerMid = mid;
+  setRemoteTyping(null);
+  sendTypingWatch();
   conversationFor(mid).unread = 0;
   saveSession();
   renderPeers();
   renderConversation();
+  closeSidebar();
+  if (window.matchMedia("(min-width: 701px)").matches) ui.messageInput.focus();
+}
+
+function closeSidebar() {
   ui.sidebar.classList.remove("is-open");
+  ui.sidebarScrim.classList.remove("is-visible");
   ui.mobileMenu.setAttribute("aria-expanded", "false");
-  ui.messageInput.focus();
+}
+
+function maskBearerToken() {
+  ui.bearerTokenValue.textContent = "••••••••••••••••";
+}
+
+function prepareProfileDialog() {
+  if (!session) return;
+  ui.profileAvatar.textContent = avatarLetter(self?.label || session.label);
+  ui.profileName.textContent = self?.label || session.label || "Your mailbox";
+  ui.profileMid.textContent = self?.mid || session.mid;
+  ui.tokenNote.textContent = session.tokenRevealUsed
+    ? "This token was shown once. It can’t be revealed or copied again."
+    : "Reveal it once, then copy it before closing. It won’t be available again.";
+  ui.revealToken.disabled = session.tokenRevealUsed;
+  ui.revealToken.textContent = session.tokenRevealUsed ? "Shown once" : "Reveal once";
+  ui.copyBearerToken.disabled = !session.tokenCopyWindowOpen || session.tokenCopyUsed;
+  ui.profileFeedback.textContent = "";
+  maskBearerToken();
+}
+
+function openProfileDialog() {
+  if (!session) return;
+  prepareProfileDialog();
+  ui.selfAvatar.setAttribute("aria-expanded", "true");
+  ui.profileDialog.showModal();
+}
+
+function closeProfileDialog() {
+  if (ui.profileDialog.open) ui.profileDialog.close();
+}
+
+function openSidebar() {
+  ui.sidebar.classList.add("is-open");
+  ui.sidebarScrim.classList.add("is-visible");
+  ui.mobileMenu.setAttribute("aria-expanded", "true");
 }
 
 function renderConversation() {
   const peer = activePeerMid ? peerByMid(activePeerMid) : null;
   ui.welcomePanel.hidden = Boolean(session && peer);
   ui.conversation.hidden = !(session && peer);
+  ui.welcomeActionLabel.textContent = session ? "Browse Pears" : "Create a mailbox";
   if (!session || !peer) return;
 
   const conversation = conversationFor(peer.mid);
@@ -269,6 +387,7 @@ function renderConversation() {
   ui.chatAvatar.textContent = avatarLetter(peer.label);
   ui.chatPeerName.textContent = peer.label || "Unnamed mailbox";
   ui.chatPeerMid.textContent = peer.mid;
+  refreshTypingIndicator();
   ui.threadStart.hidden = conversation.messages.length > 0;
   ui.threadStatus.innerHTML = "<i></i>";
   ui.threadStatus.append(document.createTextNode(conversation.finished
@@ -303,9 +422,10 @@ function renderConversation() {
     ui.messageList.append(row);
   }
 
-  const enabled = !conversation.finished && !sending;
+  const enabled = !conversation.finished;
   ui.messageInput.disabled = !enabled;
-  ui.sendButton.disabled = !enabled;
+  ui.messageInput.readOnly = sending;
+  ui.sendButton.disabled = !enabled || sending;
   ui.summaryButton.disabled = conversation.finished || sending || conversation.awaitingFinal;
   ui.finishChat.disabled = conversation.finished || sending;
   if (stickToBottom) {
@@ -398,6 +518,10 @@ async function pollInbox() {
 }
 
 async function activateMailbox(token, initial = {}) {
+  const mailboxMid = initial.mid || token.split(".")[0];
+  const tokenRevealUsed = (session?.token === token && Boolean(session.tokenRevealUsed))
+    || sessionStorage.getItem(`${TOKEN_ACCESS_PREFIX}${mailboxMid}`) === "used";
+  const tokenCopyUsed = session?.token === token && Boolean(session.tokenCopyUsed);
   sessionGeneration += 1;
   session = {
     token,
@@ -406,6 +530,9 @@ async function activateMailbox(token, initial = {}) {
     cursor: "0",
     handled: [],
     conversations: {},
+    tokenRevealUsed,
+    tokenCopyUsed,
+    tokenCopyWindowOpen: false,
   };
   self = { mid: session.mid, label: session.label };
   saveSession();
@@ -438,16 +565,149 @@ function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
   if (peerRefreshTimer) clearInterval(peerRefreshTimer);
   pollInbox();
+  connectTypingSocket();
   pollTimer = setInterval(pollInbox, POLL_INTERVAL_MS);
   peerRefreshTimer = setInterval(() => {
     loadPeers().catch(() => {});
   }, 15_000);
 }
 
+function sendTypingWatch() {
+  if (typingSocket?.readyState !== WebSocket.OPEN) return;
+  typingSocket.send(JSON.stringify({ type: "watch", peer: activePeerMid }));
+}
+
+function setRemoteTyping(mid) {
+  remoteTypingMid = mid;
+  if (remoteTypingTimer) clearTimeout(remoteTypingTimer);
+  remoteTypingTimer = mid ? setTimeout(() => setRemoteTyping(null), TYPING_VISIBLE_MS) : null;
+  refreshTypingIndicator();
+}
+
+function refreshTypingIndicator() {
+  const peer = activePeerMid ? peerByMid(activePeerMid) : null;
+  const remoteTyping = Boolean(peer && remoteTypingMid === peer.mid);
+  const overlap = remoteTyping && localTypingVisible;
+
+  if (overlap && !sharedMomentActive && !sharedMomentTimer) {
+    sharedMomentTimer = setTimeout(() => {
+      sharedMomentTimer = null;
+      const stillOverlapping = activePeerMid === peer?.mid && remoteTypingMid === peer?.mid && localTypingVisible;
+      if (stillOverlapping) sharedMomentActive = true;
+      refreshTypingIndicator();
+    }, 480);
+  } else if (!overlap) {
+    if (sharedMomentTimer) clearTimeout(sharedMomentTimer);
+    sharedMomentTimer = null;
+    sharedMomentActive = false;
+  }
+
+  const shared = overlap && sharedMomentActive;
+  ui.typingIndicator.hidden = !remoteTyping;
+  ui.typingIndicator.classList.toggle("is-shared", shared);
+  ui.localTypingBubble.hidden = !shared;
+  ui.typingIndicator.setAttribute("aria-label", shared
+    ? `You and ${peer.label || "your Pear"} are typing`
+    : "Typing");
+}
+
+function stopTyping() {
+  if (typingStopTimer) clearTimeout(typingStopTimer);
+  if (typingHeartbeatTimer) clearInterval(typingHeartbeatTimer);
+  if (localTypingTimer) clearTimeout(localTypingTimer);
+  typingStopTimer = null;
+  typingHeartbeatTimer = null;
+  localTypingTimer = null;
+  if (typingActive && typingSocket?.readyState === WebSocket.OPEN) {
+    typingSocket.send(JSON.stringify({ type: "typing", active: false }));
+  }
+  typingActive = false;
+  localTypingVisible = false;
+  refreshTypingIndicator();
+}
+
+function noteTyping() {
+  if (!session || !activePeerMid) return;
+  localTypingVisible = true;
+  if (localTypingTimer) clearTimeout(localTypingTimer);
+  localTypingTimer = setTimeout(() => {
+    localTypingTimer = null;
+    localTypingVisible = false;
+    refreshTypingIndicator();
+  }, TYPING_IDLE_MS);
+  refreshTypingIndicator();
+  if (!typingActive && typingSocket?.readyState === WebSocket.OPEN) {
+    typingSocket.send(JSON.stringify({ type: "typing", active: true }));
+    typingActive = true;
+    typingHeartbeatTimer = setInterval(() => {
+      if (typingSocket?.readyState === WebSocket.OPEN) typingSocket.send(JSON.stringify({ type: "typing", active: true }));
+    }, TYPING_HEARTBEAT_MS);
+  }
+  if (typingStopTimer) clearTimeout(typingStopTimer);
+  typingStopTimer = setTimeout(stopTyping, TYPING_IDLE_MS);
+}
+
+function closeTypingSocket() {
+  stopTyping();
+  if (typingReconnectTimer) clearTimeout(typingReconnectTimer);
+  typingReconnectTimer = null;
+  const socket = typingSocket;
+  typingSocket = null;
+  if (socket && socket.readyState < WebSocket.CLOSING) socket.close(1000, "session closed");
+  setRemoteTyping(null);
+}
+
+async function connectTypingSocket() {
+  if (!session || document.visibilityState === "hidden" || typingSocket || typingReconnectTimer) return;
+  const generation = sessionGeneration;
+  try {
+    const { mid, ticket } = await api("/presence-ticket", { method: "POST" });
+    if (!session || generation !== sessionGeneration || mid !== session.mid) return;
+    const endpoint = new URL("/presence", window.location.href);
+    endpoint.protocol = endpoint.protocol === "https:" ? "wss:" : "ws:";
+    endpoint.search = new URLSearchParams({ mid, ticket }).toString();
+    const socket = new WebSocket(endpoint);
+    typingSocket = socket;
+    socket.addEventListener("open", () => {
+      if (typingSocket !== socket) return;
+      typingReconnectAttempt = 0;
+      sendTypingWatch();
+      if (typingActive) socket.send(JSON.stringify({ type: "typing", active: true }));
+    });
+    socket.addEventListener("message", (event) => {
+      if (typingSocket !== socket) return;
+      let data;
+      try { data = JSON.parse(event.data); } catch { return; }
+      if (data.type === "typing" && data.from === activePeerMid) setRemoteTyping(data.active ? data.from : null);
+    });
+    socket.addEventListener("close", () => {
+      if (typingSocket !== socket) return;
+      typingSocket = null;
+      setRemoteTyping(null);
+      stopTyping();
+      scheduleTypingReconnect();
+    });
+    socket.addEventListener("error", () => socket.close());
+  } catch {
+    if (generation === sessionGeneration) scheduleTypingReconnect();
+  }
+}
+
+function scheduleTypingReconnect() {
+  if (!session || document.visibilityState === "hidden" || typingReconnectTimer) return;
+  const delay = Math.min(30_000, 1000 * (2 ** Math.min(typingReconnectAttempt++, 5)));
+  typingReconnectTimer = setTimeout(() => {
+    typingReconnectTimer = null;
+    connectTypingSocket();
+  }, delay);
+}
+
 async function sendMessage(text, type = "msg") {
   if (!session || !activePeerMid || sending) return false;
   const conversation = conversationFor(activePeerMid);
   const generation = sessionGeneration;
+  const peerMid = activePeerMid;
+  const restoreComposerFocus = ui.composerForm.contains(document.activeElement);
   if (conversation.finished) return false;
   const thread = ensureThread(conversation);
   const seq = conversation.seq;
@@ -490,6 +750,13 @@ async function sendMessage(text, type = "msg") {
   } finally {
     sending = false;
     renderConversation();
+    const focusTarget = document.activeElement;
+    if (restoreComposerFocus
+      && activePeerMid === peerMid
+      && !conversation.finished
+      && (focusTarget === document.body || ui.composerForm.contains(focusTarget))) {
+      ui.messageInput.focus();
+    }
   }
 }
 
@@ -569,10 +836,49 @@ $("leaveMailbox").addEventListener("click", async () => {
 $("copyMid").addEventListener("click", async () => {
   try {
     await navigator.clipboard.writeText(self?.mid || "");
-    showToast("Mailbox ID copied.");
+    ui.profileFeedback.textContent = "Mailbox ID copied.";
   } catch {
-    showToast("Could not access the clipboard.", true);
+    ui.profileFeedback.textContent = "Could not access the clipboard.";
   }
+});
+
+ui.copyBearerToken.addEventListener("click", async () => {
+  if (!session || !session.tokenCopyWindowOpen || session.tokenCopyUsed || !ui.profileDialog.open) return;
+  try {
+    await navigator.clipboard.writeText(session.token);
+    session.tokenCopyUsed = true;
+    saveSession();
+    ui.copyBearerToken.disabled = true;
+    ui.profileFeedback.textContent = "Bearer token copied. Keep it private.";
+  } catch {
+    ui.profileFeedback.textContent = "Could not access the clipboard.";
+  }
+});
+
+ui.revealToken.addEventListener("click", () => {
+  if (!session || session.tokenRevealUsed) return;
+  ui.bearerTokenValue.textContent = session.token;
+  session.tokenRevealUsed = true;
+  session.tokenCopyWindowOpen = true;
+  sessionStorage.setItem(`${TOKEN_ACCESS_PREFIX}${session.mid}`, "used");
+  saveSession();
+  ui.revealToken.disabled = true;
+  ui.revealToken.textContent = "Shown once";
+  ui.copyBearerToken.disabled = false;
+  ui.tokenNote.textContent = "Copy it now if you need it. It won’t be available again after closing.";
+});
+
+ui.selfAvatar.addEventListener("click", openProfileDialog);
+ui.closeProfile.addEventListener("click", closeProfileDialog);
+ui.profileDialog.addEventListener("close", () => {
+  ui.selfAvatar.setAttribute("aria-expanded", "false");
+  ui.profileFeedback.textContent = "";
+  maskBearerToken();
+  if (session) session.tokenCopyWindowOpen = false;
+  ui.copyBearerToken.disabled = true;
+});
+ui.profileDialog.addEventListener("click", (event) => {
+  if (event.target === ui.profileDialog) closeProfileDialog();
 });
 
 $("refreshPeers").addEventListener("click", async () => {
@@ -588,6 +894,7 @@ ui.peerSearch.addEventListener("input", renderPeers);
 
 ui.composerForm.addEventListener("submit", async (event) => {
   event.preventDefault();
+  stopTyping();
   const text = ui.messageInput.value.trim();
   if (!text) return;
   if (new TextEncoder().encode(text).byteLength > 64 * 1024) {
@@ -603,7 +910,16 @@ ui.messageInput.addEventListener("keydown", (event) => {
     ui.composerForm.requestSubmit();
   }
 });
-ui.messageInput.addEventListener("input", resizeComposer);
+ui.messageInput.addEventListener("input", () => {
+  resizeComposer();
+  noteTyping();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") closeTypingSocket();
+  else if (session) connectTypingSocket();
+});
+window.addEventListener("pagehide", stopTyping);
 
 ui.summaryButton.addEventListener("click", () => {
   sendMessage("Please wrap up and write the final summary of our conversation.", "final");
@@ -614,8 +930,30 @@ ui.finishChat.addEventListener("click", () => {
 });
 
 ui.mobileMenu.addEventListener("click", () => {
-  const opened = ui.sidebar.classList.toggle("is-open");
-  ui.mobileMenu.setAttribute("aria-expanded", String(opened));
+  if (ui.sidebar.classList.contains("is-open")) closeSidebar();
+  else openSidebar();
+});
+
+ui.themeToggle.addEventListener("click", () => {
+  themePreference = themePreference === "system"
+    ? (systemTheme.matches ? "light" : "dark")
+    : "system";
+  try {
+    localStorage.setItem(THEME_STORAGE_KEY, themePreference);
+  } catch {}
+  applyThemePreference();
+});
+
+const onSystemThemeChange = () => {
+  if (themePreference === "system") applyThemePreference();
+};
+if (systemTheme.addEventListener) systemTheme.addEventListener("change", onSystemThemeChange);
+else systemTheme.addListener(onSystemThemeChange);
+
+ui.welcomeAction.addEventListener("click", openSidebar);
+ui.sidebarScrim.addEventListener("click", closeSidebar);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") closeSidebar();
 });
 
 async function boot() {

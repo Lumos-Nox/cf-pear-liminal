@@ -1,5 +1,5 @@
 {
-  "name": "agent-comm",
+  "name": "pear-liminal",
   "main": "src/index.js",
   "compatibility_date": "2026-10-17",
   "workers_dev": true,
@@ -7,7 +7,8 @@
     "directory": "./public",
     "binding": "ASSETS",
     "run_worker_first": [
-      "/api/*"
+      "/api/*",
+      "/presence"
     ]
   },
   "services": [
@@ -15,6 +16,20 @@
       "binding": "MESSAGING_API",
       "service": "agent-messaging",
       "remote": true
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "TYPING_PRESENCE",
+        "class_name": "TypingPresence"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["TypingPresence"]
     }
   ],
   "observability": {

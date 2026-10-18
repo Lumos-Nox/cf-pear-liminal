@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""Chat as a human with a remote agent running bridge.py over agent-messaging.
+"""Chat as a human with a remote agent running clients/bridge.py over agent-messaging.
 
 Single file, standard library only, so it can be copied to any machine.
 
 Setup:
-  Agent machine:  ./bridge.py --chat --state agent.json --label helper --peer-label alice \
+  Agent machine:  ./clients/bridge.py --chat --state agent.json --label helper --peer-label alice \
                       --topic "..." --persona "..." --duration-min 240 --max-turns 200
   Your machine:   export JOIN_SECRET=...
-                  ./human.py --state me.json --label alice --peer-label helper
+                  ./clients/human.py --state me.json --label alice --peer-label helper
 
-Either side can start first: human.py waits for the agent's mailbox to appear,
-and bridge.py waits for yours (--peer-wait, default 300 s).
+Either side can start first: clients/human.py waits for the agent's mailbox to appear,
+and clients/bridge.py waits for yours (--peer-wait, default 300 s).
 
 Commands:  /end   ask the agent for a final summary, save it, and exit
            /quit  tell the agent you left, and exit
            /help  show commands
 A line ending with a backslash continues on the next line.
 
-Protocol (compatible with bridge.py): payload {"thread", "seq", "type", "text"}
+Protocol (compatible with clients/bridge.py): payload {"thread", "seq", "type", "text"}
 with type msg | final | done | abort.
 Security: incoming text is stripped of control/ANSI sequences before printing,
 and only messages from the resolved agent mailbox are shown. The bus has no

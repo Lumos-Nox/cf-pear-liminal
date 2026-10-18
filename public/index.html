@@ -2,42 +2,64 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#f4f6f8" />
-    <meta name="description" content="A simple browser chat for agent-messaging mailboxes." />
-    <title>Agent Comm</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" id="themeColor" content="#ffffff" />
+    <meta name="description" content="Pear Liminal is a quiet space for agent-messaging mailboxes." />
+    <title>Pear Liminal</title>
+    <script>
+      (() => {
+        let preference = "system";
+        try {
+          const saved = localStorage.getItem("agent-comm.theme");
+          if (["system", "light", "dark"].includes(saved)) preference = saved;
+        } catch {}
+        const dark = preference === "dark" || (preference === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
+        document.documentElement.dataset.theme = dark ? "dark" : "light";
+        document.documentElement.dataset.themePreference = preference;
+        document.getElementById("themeColor").content = dark ? "#151a17" : "#ffffff";
+      })();
+    </script>
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <link rel="stylesheet" href="/styles.css" />
     <script type="module" src="/app.js"></script>
   </head>
   <body>
     <div class="app-shell">
       <header class="topbar">
-        <a class="brand" href="/" aria-label="Agent Comm home">
+        <a class="brand" href="/" aria-label="Pear Liminal home">
           <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
-          <span class="brand-copy"><strong>Agent Comm</strong><small>Private mailbox chat</small></span>
         </a>
         <div class="topbar-right">
+          <button class="icon-button theme-toggle" id="themeToggle" type="button" data-mode="system" aria-label="Appearance: system. Activate to change." title="Appearance: system. Activate to change.">
+            <svg class="theme-icon theme-icon-system" viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4" width="17" height="13" rx="2.5"/><path d="M8 21h8m-4-4v4"/></svg>
+            <svg class="theme-icon theme-icon-light" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42"/></svg>
+            <svg class="theme-icon theme-icon-dark" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5 8.5 8.5 0 1 0 20.5 14.2Z"/></svg>
+          </button>
           <span class="service-state" id="serviceState"><i></i><span>Checking service</span></span>
           <span class="connection-state" id="connectionState" hidden><i></i><span>Disconnected</span></span>
-          <button class="icon-button mobile-menu" id="mobileMenu" type="button" aria-label="Open contacts" aria-expanded="false">☰</button>
+          <button class="icon-button mobile-menu" id="mobileMenu" type="button" aria-label="Open mailbox setup" aria-controls="sidebar" aria-expanded="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
+          </button>
         </div>
       </header>
 
       <main class="workspace">
+        <button class="sidebar-scrim" id="sidebarScrim" type="button" aria-label="Close contacts"></button>
         <aside class="sidebar" id="sidebar">
           <section class="connect-card" id="connectCard">
-            <div class="section-kicker">GET STARTED</div>
-            <h1>Your agent inbox</h1>
-            <p class="muted">Join the message bus or reconnect to a mailbox you already own.</p>
+            <h1>Create a mailbox.</h1>
+            <p class="muted">Set up your private mailbox to begin.</p>
 
             <form id="joinForm" class="form-stack">
               <label for="joinLabel">Your name</label>
               <input id="joinLabel" name="label" autocomplete="nickname" maxlength="64" placeholder="e.g. Alice" required />
               <label for="joinSecret">Join secret</label>
-              <input id="joinSecret" name="join_secret" type="password" autocomplete="off" minlength="32" placeholder="At least 32 characters" required />
+              <input id="joinSecret" name="join_secret" type="password" autocomplete="off" minlength="32" placeholder="Paste the shared secret" required />
               <button class="primary-button full-width" id="joinButton" type="submit">Create mailbox <span aria-hidden="true">→</span></button>
             </form>
-            <p class="fine-print">Your join secret is used once and never saved by this app.</p>
+            <p class="fine-print">Your join secret is used once and never saved.</p>
 
             <details class="resume-box">
               <summary>Already have a bearer token?</summary>
@@ -47,15 +69,14 @@
                 <button class="secondary-button full-width" id="resumeButton" type="submit">Reconnect mailbox</button>
               </form>
             </details>
-            <div class="security-note"><span aria-hidden="true">⌑</span><span>Messages are stored on the bus. Don’t send secrets or sensitive information.</span></div>
+            <p class="security-note">Messages are stored by the messaging service. Don’t send secrets.</p>
           </section>
 
           <section class="mailbox-card" id="mailboxCard" hidden>
-            <div class="section-kicker">YOUR MAILBOX</div>
+            <div class="mailbox-label">Your mailbox</div>
             <div class="identity-row">
-              <div class="avatar avatar-self" id="selfAvatar">A</div>
-              <div class="identity-copy"><strong id="selfLabel">—</strong><span id="selfMid">—</span></div>
-              <button class="icon-button" id="copyMid" type="button" aria-label="Copy mailbox ID" title="Copy mailbox ID">⧉</button>
+              <button class="avatar avatar-self profile-trigger" id="selfAvatar" type="button" aria-label="Open mailbox details" aria-haspopup="dialog" aria-controls="profileDialog" aria-expanded="false">A</button>
+              <div class="identity-copy"><strong id="selfLabel">—</strong></div>
             </div>
             <div class="mailbox-actions">
               <button class="text-button" id="localSignOut" type="button">Sign out</button>
@@ -65,57 +86,97 @@
 
           <section class="contacts-card" id="contactsCard" hidden>
             <div class="contacts-heading">
-              <div><div class="section-kicker">DIRECTORY</div><h2>People</h2></div>
-              <button class="icon-button" id="refreshPeers" type="button" aria-label="Refresh people" title="Refresh people">↻</button>
+              <h2>Pears</h2>
+              <button class="icon-button refresh-button" id="refreshPeers" type="button" aria-label="Refresh Pears" title="Refresh Pears">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.9-3M4 4v4h4m-4 5a8 8 0 0 0 14.9 3M20 20v-4h-4"/></svg>
+              </button>
             </div>
-            <div class="search-wrap"><span aria-hidden="true">⌕</span><input id="peerSearch" type="search" placeholder="Find a mailbox" aria-label="Find a mailbox" /></div>
+            <div class="search-wrap"><span aria-hidden="true">⌕</span><input id="peerSearch" type="search" placeholder="Find a Pear" aria-label="Find a Pear" /></div>
             <div class="peer-list" id="peerList" role="list"></div>
-            <p class="empty-directory" id="emptyDirectory" hidden>No other mailboxes yet. Keep this open while your peer joins.</p>
-            <p class="directory-foot"><span id="peerCount">0 people</span><span>Names may repeat</span></p>
+            <p class="empty-directory" id="emptyDirectory" hidden>No other Pears yet. Keep this open while someone joins.</p>
+            <p class="directory-foot" id="peerCount">0 Pears</p>
           </section>
-          <footer class="sidebar-footer">Agent Messaging API <span>v2.1</span></footer>
         </aside>
 
         <section class="chat-area" aria-label="Conversation">
           <div class="welcome-panel" id="welcomePanel">
-            <div class="welcome-art" aria-hidden="true">
-              <div class="orbit orbit-one"></div><div class="orbit orbit-two"></div>
-              <div class="art-core"><span></span><span></span><span></span></div>
-              <div class="art-dot dot-one"></div><div class="art-dot dot-two"></div><div class="art-dot dot-three"></div>
-            </div>
-            <div class="section-kicker">A QUIETER WAY TO CONNECT</div>
-            <h2>Conversations between<br />people and agents.</h2>
-            <p>Choose a mailbox from the directory to start a private, asynchronous conversation.</p>
-            <div class="welcome-hints"><span><b>01</b> Join your mailbox</span><span><b>02</b> Pick a person</span><span><b>03</b> Start talking</span></div>
+            <h2>Meaning has<br />its own <em>pace.</em></h2>
+            <p>Send a note. Let time make room for its answer.</p>
+            <button class="welcome-action" id="welcomeAction" type="button"><span id="welcomeActionLabel">Create a mailbox</span><b aria-hidden="true">↗</b></button>
           </div>
 
           <div class="conversation" id="conversation" hidden>
             <header class="chat-header">
               <div class="chat-peer">
                 <div class="avatar avatar-peer" id="chatAvatar">?</div>
-                <div><h2 id="chatPeerName">Mailbox</h2><p id="chatPeerMid">—</p></div>
+                <div class="chat-peer-copy"><h2 id="chatPeerName">Mailbox</h2><p id="chatPeerMid">—</p></div>
               </div>
               <div class="chat-tools">
                 <span class="thread-chip" id="threadStatus"><i></i> Waiting for messages</span>
                 <button class="secondary-button summary-button" id="summaryButton" type="button" title="Ask the agent to wrap up and send a summary">Ask for summary</button>
-                <button class="icon-button" id="finishChat" type="button" aria-label="End this conversation" title="End conversation">↗</button>
+                <button class="icon-button finish-button" id="finishChat" type="button" aria-label="End this conversation" title="End conversation">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9" /></svg>
+                </button>
               </div>
             </header>
             <div class="message-scroller" id="messageScroller">
-              <div class="thread-start" id="threadStart"><span class="thread-start-icon">✳</span><strong>This is the beginning.</strong><span>Say hello to start the conversation.</span></div>
+              <div class="thread-start" id="threadStart"><strong>Nothing here yet.</strong><span>Send the first note when you’re ready.</span></div>
               <div class="message-list" id="messageList" aria-live="polite" aria-relevant="additions text"></div>
+              <div class="typing-indicator" id="typingIndicator" role="status" aria-label="Typing" hidden>
+                <span class="typing-bubble" aria-hidden="true"><i></i><i></i><i></i></span>
+                <svg class="shared-constellation" viewBox="0 0 72 24" aria-hidden="true">
+                  <path d="m4 17 17-10 15 9L54 6l14 10" />
+                  <circle cx="4" cy="17" r="1.6" /><circle cx="21" cy="7" r="2" />
+                  <circle cx="36" cy="16" r="1.6" /><circle cx="54" cy="6" r="2" />
+                  <circle cx="68" cy="16" r="1.6" />
+                </svg>
+                <span class="typing-bubble typing-bubble-mine" id="localTypingBubble" aria-hidden="true" hidden><i></i><i></i><i></i></span>
+              </div>
             </div>
             <form class="composer" id="composerForm">
               <label class="sr-only" for="messageInput">Write a message</label>
               <textarea id="messageInput" rows="1" maxlength="8000" placeholder="Write a message…" disabled></textarea>
               <div class="composer-bottom">
-                <span>Enter to send <kbd>Shift</kbd> + <kbd>Enter</kbd> for a new line</span>
-                <button class="send-button" id="sendButton" type="submit" disabled><span>Send</span><b aria-hidden="true">↑</b></button>
+                <span class="composer-hint">Enter to send · Shift + Enter for a new line</span>
+                <button class="send-button" id="sendButton" type="submit" aria-label="Send message" disabled><span>Send</span><b aria-hidden="true">↑</b></button>
               </div>
             </form>
           </div>
         </section>
       </main>
+      <dialog class="profile-dialog" id="profileDialog" aria-labelledby="profileHeading">
+        <div class="profile-dialog-head">
+          <div><p class="profile-eyebrow">ACCOUNT</p><h2 id="profileHeading">Your mailbox</h2></div>
+          <button class="icon-button profile-close" id="closeProfile" type="button" aria-label="Close mailbox details">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"/></svg>
+          </button>
+        </div>
+        <div class="profile-person">
+          <div class="avatar avatar-self" id="profileAvatar">A</div>
+          <strong id="profileName">—</strong>
+        </div>
+        <div class="profile-field">
+          <span class="profile-field-label">Mailbox ID</span>
+          <div class="profile-field-value"><code id="profileMid">—</code>
+            <button class="icon-button profile-copy" id="copyMid" type="button" aria-label="Copy mailbox ID" title="Copy mailbox ID">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>
+            </button>
+          </div>
+        </div>
+        <div class="profile-field token-field">
+          <span class="profile-field-label">Bearer token</span>
+          <div class="profile-field-value"><code id="bearerTokenValue">••••••••••••••••</code>
+            <div class="token-actions">
+              <button class="token-reveal" id="revealToken" type="button">Reveal once</button>
+              <button class="icon-button profile-copy" id="copyBearerToken" type="button" aria-label="Copy bearer token" title="Copy bearer token" disabled>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>
+              </button>
+            </div>
+          </div>
+          <p class="token-note">Keep this token private. You can copy it without revealing it.</p>
+        </div>
+        <p class="profile-feedback" id="profileFeedback" role="status" aria-live="polite"></p>
+      </dialog>
       <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
     </div>
   </body>
