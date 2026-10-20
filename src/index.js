@@ -30,6 +30,27 @@ const ALLOWED_QUERY = {
 const MAX_REQUEST_BYTES = 128 * 1024;
 const UPSTREAM_TIMEOUT_MS = 12_000;
 const MAILBOX_ID_PATTERN = /^m-[0-9a-f]{32}$/;
+const MAX_PRESENCE_SOCKETS = 10;
+const TYPING_EXPIRY_MS = 9_000;
+
+async function fetchMessaging(request, env) {
+  const controller = new AbortController();
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new DOMException("messaging API request timed out", "TimeoutError"));
+      controller.abort();
+    }, UPSTREAM_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([
+      env.MESSAGING_API.fetch(new Request(request, { signal: controller.signal })),
+      timeout,
+    ]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
 
 async function createPresenceTicket(request, env) {
   const authorization = request.headers.get("authorization");
@@ -37,22 +58,27 @@ async function createPresenceTicket(request, env) {
 
   let identity;
   try {
-    const response = await env.MESSAGING_API.fetch(new Request("https://agent-messaging/v1/agent/self", {
+    const response = await fetchMessaging(new Request("https://agent-messaging/v1/agent/self", {
       headers: { authorization },
-    }));
+    }), env);
     if (!response.ok) return json({ error: response.status === 401 ? "unauthorized" : "identity unavailable" }, response.status);
     identity = await response.json();
-  } catch {
-    return json({ error: "identity unavailable" }, 502);
+  } catch (error) {
+    return json({ error: "identity unavailable" }, error?.name === "TimeoutError" ? 504 : 502);
   }
 
-  if (typeof identity.mid !== "string" || !MAILBOX_ID_PATTERN.test(identity.mid)) return json({ error: "invalid identity" }, 502);
-  const id = env.TYPING_PRESENCE.idFromName(identity.mid);
-  const stub = env.TYPING_PRESENCE.get(id);
-  const ticketResponse = await stub.fetch("https://typing.internal/ticket", { method: "POST" });
-  if (!ticketResponse.ok) return json({ error: "presence unavailable" }, 503);
-  const { ticket } = await ticketResponse.json();
-  return json({ mid: identity.mid, ticket }, 200);
+  if (typeof identity?.mid !== "string" || !MAILBOX_ID_PATTERN.test(identity.mid)) return json({ error: "invalid identity" }, 502);
+  try {
+    const id = env.TYPING_PRESENCE.idFromName(identity.mid);
+    const stub = env.TYPING_PRESENCE.get(id);
+    const ticketResponse = await stub.fetch("https://typing.internal/ticket", { method: "POST" });
+    if (!ticketResponse.ok) return json({ error: "presence unavailable" }, ticketResponse.status === 429 ? 429 : 503);
+    const { ticket } = await ticketResponse.json();
+    if (typeof ticket !== "string" || !ticket) return json({ error: "presence unavailable" }, 503);
+    return json({ mid: identity.mid, ticket }, 200);
+  } catch {
+    return json({ error: "presence unavailable" }, 503);
+  }
 }
 
 async function routePresenceSocket(request, env, url) {
@@ -62,10 +88,14 @@ async function routePresenceSocket(request, env, url) {
   const mid = url.searchParams.get("mid");
   const ticket = url.searchParams.get("ticket");
   if (!mid || !MAILBOX_ID_PATTERN.test(mid) || !ticket || ticket.length > 100) return json({ error: "invalid ticket" }, 401);
-  const id = env.TYPING_PRESENCE.idFromName(mid);
-  const stub = env.TYPING_PRESENCE.get(id);
   const headers = new Headers({ Upgrade: "websocket", "x-presence-mid": mid, "x-presence-ticket": ticket });
-  return stub.fetch(new Request("https://typing.internal/connect", { method: "GET", headers }));
+  try {
+    const id = env.TYPING_PRESENCE.idFromName(mid);
+    const stub = env.TYPING_PRESENCE.get(id);
+    return await stub.fetch(new Request("https://typing.internal/connect", { method: "GET", headers }));
+  } catch {
+    return json({ error: "presence unavailable" }, 503);
+  }
 }
 
 function json(data, status = 200) {
@@ -137,7 +167,8 @@ async function proxyApi(request, env, url) {
   if (request.method !== "GET" && request.method !== "HEAD") {
     const declaredLength = Number(request.headers.get("content-length") || 0);
     if (declaredLength > MAX_REQUEST_BYTES) return json({ error: "request body too large" }, 413);
-    const parsedBody = await readLimitedBody(request);
+    let parsedBody;
+    try { parsedBody = await readLimitedBody(request); } catch { return json({ error: "could not read request body" }, 400); }
     if (parsedBody.error) return parsedBody.error;
     body = parsedBody.body;
   }
@@ -152,20 +183,12 @@ async function proxyApi(request, env, url) {
     redirect: "manual",
   });
 
-  const controller = new AbortController();
-  let timeoutId;
-  const timeout = new Promise((_, reject) => {
-    timeoutId = setTimeout(() => {
-      controller.abort();
-      reject(new Error("messaging API request timed out"));
-    }, UPSTREAM_TIMEOUT_MS);
-  });
-
   try {
-    const upstream = await Promise.race([
-      env.MESSAGING_API.fetch(new Request(upstreamRequest, { signal: controller.signal })),
-      timeout,
-    ]);
+    const upstream = await fetchMessaging(upstreamRequest, env);
+    if (upstream.status >= 300 && upstream.status < 400) {
+      await upstream.body?.cancel();
+      return json({ error: "unexpected redirect from messaging service" }, 502);
+    }
     const responseHeaders = new Headers(upstream.headers);
     responseHeaders.set("cache-control", "no-store");
     responseHeaders.set("x-content-type-options", "nosniff");
@@ -174,15 +197,13 @@ async function proxyApi(request, env, url) {
       statusText: upstream.statusText,
       headers: responseHeaders,
     });
-  } catch {
-    if (controller.signal.aborted) {
+  } catch (error) {
+    if (error?.name === "TimeoutError") {
       return json({
         error: "remote messaging service binding timed out; verify MESSAGING_API targets the correct Worker name and environment in the Cloudflare account used by Wrangler",
       }, 504);
     }
     return json({ error: "remote messaging service binding failed; verify the MESSAGING_API Worker name, environment, and Cloudflare account" }, 502);
-  } finally {
-    clearTimeout(timeoutId);
   }
 }
 
@@ -224,7 +245,8 @@ export class TypingPresence {
     if (url.pathname === "/connect" && request.method === "GET") {
       const mid = request.headers.get("x-presence-mid");
       const ticket = request.headers.get("x-presence-ticket");
-      if (!mid || !ticket) return json({ error: "invalid ticket" }, 401);
+      if (!MAILBOX_ID_PATTERN.test(mid) || !ticket) return json({ error: "invalid ticket" }, 401);
+      if (this.state.getWebSockets().length >= MAX_PRESENCE_SOCKETS) return json({ error: "too many presence connections" }, 429);
       const expiresAt = await this.state.storage.get(`ticket:${ticket}`);
       await this.state.storage.delete(`ticket:${ticket}`);
       if (typeof expiresAt !== "number" || expiresAt < Date.now()) return json({ error: "expired ticket" }, 401);
@@ -240,7 +262,7 @@ export class TypingPresence {
     if (url.pathname === "/event" && request.method === "POST") {
       let event;
       try { event = await request.json(); } catch { return json({ error: "invalid event" }, 400); }
-      if (typeof event.from !== "string" || !MAILBOX_ID_PATTERN.test(event.from) || typeof event.active !== "boolean") return json({ error: "invalid event" }, 400);
+      if (!event || typeof event.from !== "string" || !MAILBOX_ID_PATTERN.test(event.from) || typeof event.active !== "boolean") return json({ error: "invalid event" }, 400);
       for (const socket of this.state.getWebSockets()) {
         const attachment = socket.deserializeAttachment();
         if (attachment?.peer !== event.from) continue;
@@ -255,38 +277,60 @@ export class TypingPresence {
     if (typeof message !== "string" || message.length > 512) return;
     let event;
     try { event = JSON.parse(message); } catch { return; }
+    if (!event || typeof event !== "object" || Array.isArray(event)) return;
     const attachment = socket.deserializeAttachment();
     if (!attachment?.mid) return;
 
     if (event.type === "watch" && (event.peer === null || (typeof event.peer === "string" && MAILBOX_ID_PATTERN.test(event.peer)))) {
-      if (attachment.typing && attachment.peer && attachment.peer !== event.peer) {
+      if (event.peer === attachment.mid) return;
+      if (attachment.peer === event.peer) return;
+      socket.serializeAttachment({ ...attachment, peer: event.peer, typing: false, lastSignalAt: 0 });
+      if (attachment.typing && attachment.peer && !this.otherSocketTyping(attachment.peer, socket)) {
         await this.forwardTyping(attachment.peer, attachment.mid, false);
       }
-      socket.serializeAttachment({ ...attachment, peer: event.peer, typing: false, lastSignalAt: 0 });
       return;
     }
     if (event.type !== "typing" || typeof event.active !== "boolean" || !attachment.peer) return;
 
     const now = Date.now();
-    if (now - attachment.lastSignalAt < 750) return;
     if (event.active && attachment.typing && now - attachment.lastSignalAt < 5_000) return;
     if (event.active === attachment.typing && event.active === false) return;
     socket.serializeAttachment({ ...attachment, typing: event.active, lastSignalAt: now });
+    if (!event.active && this.otherSocketTyping(attachment.peer, socket)) return;
     await this.forwardTyping(attachment.peer, attachment.mid, event.active);
   }
 
-  async webSocketClose(socket) {
+  otherSocketTyping(peer, excluded) {
+    return this.state.getWebSockets().some((socket) => {
+      if (socket === excluded) return false;
+      const data = socket.deserializeAttachment();
+      return data?.peer === peer && data.typing && Date.now() - data.lastSignalAt < TYPING_EXPIRY_MS;
+    });
+  }
+
+  async webSocketClose(socket, code = 1000) {
     const attachment = socket.deserializeAttachment();
-    if (!attachment?.typing || !attachment.peer) return;
+    try { if (attachment) socket.serializeAttachment({ ...attachment, typing: false }); } catch {}
+    try { socket.close(code === 1005 || code === 1006 ? 1000 : code, "closed"); } catch {}
+    if (!attachment?.typing || !attachment.peer || this.otherSocketTyping(attachment.peer, socket)) return;
     await this.forwardTyping(attachment.peer, attachment.mid, false);
   }
 
+  async webSocketError(socket) {
+    await this.webSocketClose(socket, 1011);
+  }
   async forwardTyping(recipient, from, active) {
-    const recipientId = this.env.TYPING_PRESENCE.idFromName(recipient);
-    await this.env.TYPING_PRESENCE.get(recipientId).fetch("https://typing.internal/event", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ from, active }),
-    });
+    try {
+      const recipientId = this.env.TYPING_PRESENCE.idFromName(recipient);
+      const response = await this.env.TYPING_PRESENCE.get(recipientId).fetch("https://typing.internal/event", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ from, active }),
+      });
+      await response.body?.cancel();
+    } catch {
+      // Presence is best effort. A recipient failure must not close the sender's
+      // socket; heartbeats retry and the recipient expires stale indicators.
+    }
   }
 }

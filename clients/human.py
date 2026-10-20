@@ -13,6 +13,7 @@ Either side can start first: clients/human.py waits for the agent's mailbox to a
 and clients/bridge.py waits for yours (--peer-wait, default 300 s).
 
 Commands:  /end   ask the agent for a final summary, save it, and exit
+           /retry retry an unconfirmed message without changing its request
            /quit  tell the agent you left, and exit
            /help  show commands
 A line ending with a backslash continues on the next line.
@@ -28,6 +29,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -40,27 +42,45 @@ try:
 except ImportError:
     readline = None
 
-BASE = os.environ.get("AGENT_MESSAGING_BASE", "https://agent-messaging.your-account.workers.dev")
+BASE = os.environ.get("AGENT_MESSAGING_BASE", "https://agent-messaging.your-account.workers.dev").rstrip("/")
 CONTROL = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|[\x00-\x08\x0b-\x1f\x7f]")
 TYPES = {"msg", "final", "done", "abort"}
 PROMPT = "you> "
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        return None
+
+
 class Mailbox:
-    def __init__(self, path):
-        self.path, self.state = path, {}
-        if os.path.exists(path):
-            with open(path, encoding="utf-8") as f:
+    def __init__(self, state_path):
+        self.path = state_path
+        self.state = {}
+        self.lock = threading.RLock()
+        self.opener = urllib.request.build_opener(NoRedirect())
+        self.last_poll_status = 200
+        if os.path.exists(state_path):
+            with open(state_path, encoding="utf-8") as f:
                 self.state = json.load(f)
-        self.lock = threading.Lock()     # poll thread and input thread both save
+            if self.state.get("base", BASE).rstrip("/") != BASE:
+                sys.exit("state belongs to another API base URL; use a different --state file")
+        self.state.setdefault("base", BASE)
 
     def save(self):
         with self.lock:
-            tmp = self.path + ".tmp"
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(self.state, f, indent=1)
-            os.replace(tmp, self.path)
+            directory = os.path.dirname(os.path.abspath(self.path))
+            os.makedirs(directory, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix=os.path.basename(self.path) + ".", dir=directory)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(self.state, f, indent=1)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.path)
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
 
     def req(self, method, path, body=None, headers=None, auth=True):
         h = {"Content-Type": "application/json", "User-Agent": "agent-messaging-human"}
@@ -70,10 +90,14 @@ class Mailbox:
         data = json.dumps(body).encode() if body is not None else None
         r = urllib.request.Request(BASE + path, data=data, method=method, headers=h)
         try:
-            with urllib.request.urlopen(r, timeout=30) as resp:
-                return resp.status, json.loads(resp.read())
+            with self.opener.open(r, timeout=30) as resp:
+                result = json.loads(resp.read())
+                if not isinstance(result, dict):
+                    raise ValueError("expected a JSON object")
+                return resp.status, result
         except urllib.error.HTTPError as e:
-            return e.code, {"error": e.read().decode(errors="replace")[:300]}
+            with e:
+                return e.code, {"error": e.read().decode(errors="replace")[:300]}
         except urllib.error.URLError as e:
             return 503, {"error": str(e.reason)}
         except (OSError, ValueError) as e:
@@ -87,6 +111,7 @@ class Mailbox:
         if status not in (200, 201):
             sys.exit(f"join failed ({status}): {r}")
         self.state = {"mid": r["mid"], "token": r["token"], "label": label}
+        self.state["base"] = BASE
         self.save()
 
     def find_peer(self, label, wait):
@@ -103,6 +128,8 @@ class Mailbox:
                     seen_cursors.add(cursor)
                     params["cursor"] = cursor
                 status, r = self.req("GET", "/v1/agent/peers?" + urllib.parse.urlencode(params))
+                if status == 401:
+                    sys.exit("mailbox token is no longer valid; use a new --state file")
                 if status != 200:
                     break
                 peers.extend(r["peers"])
@@ -119,34 +146,72 @@ class Mailbox:
         sys.exit(f"agent '{label}' did not appear within {wait}s")
 
     def send(self, to, payload, key):
+        request = json.loads(json.dumps({"to": to, "payload": payload, "key": key}))
+        with self.lock:
+            pending = self.state.get("pending_send")
+            if pending and pending != request:
+                raise ValueError("an earlier send is unconfirmed; retry its exact request first")
+            self.state["pending_send"] = request
+            self.save()
+        payload = request["payload"]
         for attempt in range(6):
             status, r = self.req("POST", "/v1/agent/send", {"to": to, "payload": payload},
                                  {"Idempotency-Key": key})
             if status == 200:   # idempotent retries return the original id with duplicate=true
                 return True
-            if status in (429, 503) or status >= 500:
-                time.sleep(min(30, 2 ** attempt))
+            if status in (408, 429) or status >= 500:
+                if attempt + 1 < 6:
+                    time.sleep(min(30, 2 ** attempt))
                 continue
             if status == 409:
                 print(f"\n[send failed ({status}): idempotency key was reused with a different request: {r}]")
                 return False
+            if 400 <= status < 500 and status not in (408, 409, 429):
+                with self.lock:
+                    self.state.pop("pending_send", None)
+                    self.save()
             print(f"\n[send failed ({status}): {r}]")
             return False
         print("\n[send failed: bus unreachable or agent inbox full]")
         return False
 
     def poll(self):
-        out = []
+        # A cursor is committed only together with the messages it covers. A crash
+        # before the caller records/acks them will replay this local inbox.
+        with self.lock:
+            if self.state.get("inbox"):
+                return list(self.state["inbox"])
+        seen_cursors = set()
         while True:
-            q = urllib.parse.urlencode({"since": self.state.get("cursor", "0"), "limit": 100})
-            status, r = self.req("GET", "/v1/agent/poll?" + q)
-            if status != 200:
-                return out
-            out.extend(r["messages"])
-            self.state["cursor"] = r["cursor"]
+            cursor = str(self.state.get("cursor", "0"))
+            if cursor in seen_cursors:
+                break
+            seen_cursors.add(cursor)
+            q = urllib.parse.urlencode({"since": cursor, "limit": 100})
+            status, result = self.req("GET", "/v1/agent/poll?" + q)
+            self.last_poll_status = status
+            if status != 200 or not isinstance(result.get("messages"), list):
+                break
+            with self.lock:
+                inbox = self.state.setdefault("inbox", [])
+                previous_size = len(inbox)
+                ids = {message.get("id") for message in inbox}
+                for message in result["messages"]:
+                    if isinstance(message, dict) and isinstance(message.get("id"), str) and message["id"] not in ids:
+                        inbox.append(message)
+                        ids.add(message["id"])
+                self.state["cursor"] = str(result.get("cursor", cursor))
+                if len(inbox) != previous_size or self.state["cursor"] != cursor:
+                    self.save()
+            if not result.get("has_more") or not result["messages"]:
+                break
+        with self.lock:
+            return list(self.state.get("inbox", []))
+
+    def ack(self, message_id):
+        with self.lock:
+            self.state["inbox"] = [message for message in self.state.get("inbox", []) if message.get("id") != message_id]
             self.save()
-            if not r.get("has_more") or not r["messages"]:
-                return out
 
 
 def clean(text):
@@ -168,6 +233,8 @@ class Chat:
         else:
             print(f"[waiting for agent '{a.peer_label}' to join...]")
             self.peer = self.mb.find_peer(a.peer_label, a.peer_wait)
+        if s.get("peer") and s["peer"] != self.peer:
+            sys.exit("state belongs to another peer; use a different --state file")
         self.name = a.peer_label or "agent"
         s["peer"] = self.peer
         s.setdefault("thread", uuid.uuid4().hex[:8])
@@ -175,7 +242,8 @@ class Chat:
         s.setdefault("handled", [])
         self.mb.save()
         os.makedirs(a.out, exist_ok=True)
-        self.transcript = os.path.join(a.out, f"{a.label}-transcript.md")
+        self.file_label = re.sub(r"[/\\]", "_", a.label)
+        self.transcript = os.path.join(a.out, f"{self.file_label}-transcript.md")
         self.over = threading.Event()    # set when the agent sends done/abort
         self.pending = 0                 # messages sent and not yet answered
         self.input_active = False
@@ -200,24 +268,43 @@ class Chat:
     def send(self, kind, text):
         s = self.s
         payload = {"thread": s["thread"], "seq": s["seq"], "type": kind, "text": text}
-        if self.mb.send(self.peer, payload, f"{s['thread']}-h{s['seq']}"):
-            s["seq"] += 1
-            self.mb.save()
+        try:
+            accepted = self.mb.send(self.peer, payload, f"{s['thread']}-h{s['seq']}")
+        except ValueError as error:
+            print(f"[{error}; use /retry]")
+            return False
+        if accepted:
+            with self.mb.lock:
+                s["seq"] += 1
+                s.pop("pending_send", None)
+                if kind in ("done", "abort"):
+                    s["finished"] = True
+                if kind == "final":
+                    s["awaiting_final"] = True
+                self.mb.save()
             self.log(self.a.label, kind, text)
             self.pending += 1
             return True
         return False
 
+    def retry(self):
+        pending = self.s.get("pending_send")
+        if not pending:
+            print("[no unconfirmed message to retry]")
+            return False
+        payload = pending["payload"]
+        return self.send(payload["type"], payload["text"])
+
     def poll_loop(self):
         while not self.over.is_set():
             for m in self.mb.poll():
                 if m["id"] in self.s["handled"] or m.get("from") != self.peer:
+                    self.mb.ack(m["id"])
                     continue
-                self.s["handled"] = (self.s["handled"] + [m["id"]])[-500:]
-                self.mb.save()
                 pl = m.get("payload")
-                if not isinstance(pl, dict) or pl.get("type", "msg") not in TYPES \
+                if not isinstance(pl, dict) or not isinstance(pl.get("type", "msg"), str) or pl.get("type", "msg") not in TYPES \
                         or pl.get("thread") not in (None, self.s["thread"]):
+                    self.mb.ack(m["id"])
                     continue
                 kind, text = pl.get("type", "msg"), clean(str(pl.get("text", "")))
                 self.pending = max(0, self.pending - 1)
@@ -226,12 +313,23 @@ class Chat:
                 self.show(f"\n{self.name} [{ts}]{'' if kind == 'msg' else f' ({kind})'}:\n{text}\n")
                 if kind in ("done", "abort", "final"):
                     if kind in ("done", "final"):
-                        path = os.path.join(self.a.out, f"{self.a.label}-final.md")
+                        path = os.path.join(self.a.out, f"{self.file_label}-final.md")
                         with open(path, "w", encoding="utf-8") as f:
                             f.write(text + "\n")
                         self.show(f"[summary saved to {path}]")
+                    with self.mb.lock:
+                        self.s["handled"] = (self.s["handled"] + [m["id"]])[-500:]
+                        self.s["finished"] = True
+                        self.mb.ack(m["id"])
                     self.over.set()
                     return
+                with self.mb.lock:
+                    self.s["handled"] = (self.s["handled"] + [m["id"]])[-500:]
+                    self.mb.ack(m["id"])
+            if self.mb.last_poll_status == 401:
+                self.show("[mailbox token expired; press Enter to exit]")
+                self.over.set()
+                return
             time.sleep(self.a.interval)
 
 
@@ -248,7 +346,19 @@ class Chat:
             self.input_active = False
 
     def run(self):
+        if self.s.get("finished"):
+            print("[conversation already ended; use a new --state for a fresh one]")
+            return
+        if self.s.get("pending_send"):
+            print("[retrying the saved, unconfirmed outgoing message]")
+            if not self.retry():
+                print("[send remains unconfirmed; use /retry]")
+        if self.s.get("finished"):
+            return
         threading.Thread(target=self.poll_loop, daemon=True).start()
+        if self.s.get("awaiting_final"):
+            self.over.wait(self.a.final_wait) or print("[no summary arrived; exiting]")
+            return
         while not self.over.is_set():
             try:
                 text = self.read_message()
@@ -269,6 +379,8 @@ class Chat:
                     print(f"[asked {self.name} for a final summary; waiting up to {self.a.final_wait}s]")
                     self.over.wait(self.a.final_wait) or print("[no summary arrived; exiting]")
                 return
+            elif text == "/retry":
+                self.retry()
             elif text.startswith("/"):
                 print("[unknown command; /help lists them]")
             elif self.send("msg", text):
@@ -293,6 +405,8 @@ def main():
     a = ap.parse_args()
     if not (a.peer_label or a.peer_mid):
         ap.error("one of --peer-label or --peer-mid is required")
+    if any(value <= 0 for value in (a.interval, a.peer_wait, a.final_wait)):
+        ap.error("interval and wait times must be positive")
     chat = Chat(a)
     try:
         chat.run()

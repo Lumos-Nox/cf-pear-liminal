@@ -1,3 +1,5 @@
+import { trackAppViewport } from "./viewport.js";
+
 const STORAGE_KEY = "agent-comm.session.v1";
 const TOKEN_ACCESS_PREFIX = `${STORAGE_KEY}.token-access.`;
 const THEME_STORAGE_KEY = "agent-comm.theme";
@@ -6,6 +8,8 @@ const TYPING_IDLE_MS = 1200;
 const TYPING_HEARTBEAT_MS = 6000;
 const TYPING_VISIBLE_MS = 9000;
 const MESSAGE_TYPES = new Set(["msg", "final", "done", "abort"]);
+const MAILBOX_ID_PATTERN = /^m-[0-9a-f]{32}$/;
+const avatarSegmenter = globalThis.Intl?.Segmenter ? new Intl.Segmenter(undefined, { granularity: "grapheme" }) : null;
 
 const $ = (id) => document.getElementById(id);
 const ui = {
@@ -47,6 +51,9 @@ const ui = {
   sendButton: $("sendButton"),
   summaryButton: $("summaryButton"),
   finishChat: $("finishChat"),
+  newChat: $("newChat"),
+  sendRecovery: $("sendRecovery"),
+  retrySend: $("retrySend"),
   toast: $("toast"),
   sidebar: $("sidebar"),
   mobileMenu: $("mobileMenu"),
@@ -67,15 +74,20 @@ function applyThemePreference() {
   ui.themeToggle.dataset.mode = themePreference;
 
   const appearance = themePreference === "system" ? `system (${mode})` : themePreference;
-  const next = themePreference === "system" ? (mode === "dark" ? "light" : "dark") : "system";
-  const label = `Appearance: ${appearance}. Activate to ${themePreference === "system" ? `use ${next}` : "follow system"}.`;
+  const next = nextThemePreference();
+  const label = `Appearance: ${appearance}. Activate to ${next === "system" ? "follow system" : `use ${next}`}.`;
   ui.themeToggle.setAttribute("aria-label", label);
   ui.themeToggle.title = label;
   const themeColor = $("themeColor");
   if (themeColor) themeColor.content = mode === "dark" ? "#151a17" : "#ffffff";
 }
 
+function nextThemePreference() {
+  return themePreference === "system" ? "light" : themePreference === "light" ? "dark" : "system";
+}
+
 applyThemePreference();
+trackAppViewport();
 
 let session = readSession();
 let self = null;
@@ -83,11 +95,20 @@ let peers = [];
 let activePeerMid = null;
 let pollTimer = null;
 let peerRefreshTimer = null;
-let pollInFlight = false;
+let pollingGeneration = null;
+let peerLoad = null;
+let saveTimer = null;
+let storageWarningShown = false;
+let renderedPeerMid = null;
+let renderedMessages = [];
+let renderedMessageNames = "";
+let peerRenderSignature = "";
 let sending = false;
 let toastTimer = null;
 let sessionGeneration = 0;
 let typingSocket = null;
+let typingConnectAttempt = null;
+let typingConnectionGeneration = 0;
 let typingReconnectTimer = null;
 let typingReconnectAttempt = 0;
 let typingHeartbeatTimer = null;
@@ -102,39 +123,76 @@ let remoteTypingMid = null;
 
 function readSession() {
   try {
-    const saved = JSON.parse(sessionStorage.getItem(STORAGE_KEY) || "null");
-    if (!saved || typeof saved.token !== "string" || typeof saved.mid !== "string") return null;
+    const saved = JSON.parse(storageGet(STORAGE_KEY) || "null");
+    if (!saved || typeof saved.token !== "string" || !MAILBOX_ID_PATTERN.test(saved.mid)) return null;
     saved.cursor = String(saved.cursor || "0");
     saved.handled = Array.isArray(saved.handled) ? saved.handled : [];
     saved.tokenRevealUsed = Boolean(saved.tokenRevealUsed);
     saved.tokenCopyUsed = Boolean(saved.tokenCopyUsed);
     saved.tokenCopyWindowOpen = false;
-    if (sessionStorage.getItem(`${TOKEN_ACCESS_PREFIX}${saved.mid}`) === "used") saved.tokenRevealUsed = true;
-    saved.conversations = saved.conversations && typeof saved.conversations === "object"
+    if (storageGet(`${TOKEN_ACCESS_PREFIX}${saved.mid}`) === "used") saved.tokenRevealUsed = true;
+    saved.conversations = saved.conversations && typeof saved.conversations === "object" && !Array.isArray(saved.conversations)
       ? saved.conversations : {};
     return saved;
   } catch {
-    sessionStorage.removeItem(STORAGE_KEY);
+    storageRemove(STORAGE_KEY);
     return null;
   }
 }
 
+function storageGet(key) {
+  try { return sessionStorage.getItem(key); } catch { return null; }
+}
+
+function storageRemove(key) {
+  try { sessionStorage.removeItem(key); } catch {}
+}
+
+function storageSet(key, value) {
+  try { sessionStorage.setItem(key, value); return true; } catch { return false; }
+}
+
 function saveSession() {
-  if (session) sessionStorage.setItem(STORAGE_KEY, JSON.stringify(session));
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  if (session && !storageSet(STORAGE_KEY, JSON.stringify(session))) {
+    storageRemove(STORAGE_KEY);
+    if (!storageWarningShown) {
+      storageWarningShown = true;
+      showToast("This browser could not save the tab session. Keep this tab open; refreshing may lose recent history.", true);
+    }
+  }
+}
+
+function scheduleSessionSave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveSession, 250);
+}
+
+function stopPolling() {
+  clearInterval(pollTimer);
+  clearInterval(peerRefreshTimer);
+  pollTimer = null;
+  peerRefreshTimer = null;
 }
 
 function clearSession() {
   sessionGeneration += 1;
   closeTypingSocket();
-  sessionStorage.removeItem(STORAGE_KEY);
+  typingReconnectAttempt = 0;
+  closeProfileDialog();
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  storageRemove(STORAGE_KEY);
   session = null;
   self = null;
   peers = [];
   activePeerMid = null;
-  if (pollTimer) clearInterval(pollTimer);
-  if (peerRefreshTimer) clearInterval(peerRefreshTimer);
-  pollTimer = null;
-  peerRefreshTimer = null;
+  sending = false;
+  ui.messageInput.value = "";
+  ui.peerSearch.value = "";
+  resizeComposer();
+  stopPolling();
   setConnected(false);
   renderPeers();
   renderConversation();
@@ -154,32 +212,38 @@ async function api(path, options = {}) {
   if (options.adminSecret) headers["X-Admin-Secret"] = options.adminSecret;
   if (options.idempotencyKey) headers["Idempotency-Key"] = options.idempotencyKey;
 
-  let response;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
   try {
-    response = await fetch(`/api${path}`, {
+    const response = await fetch(`/api${path}`, {
       method: options.method || "GET",
       headers,
       body: options.body === undefined ? undefined : JSON.stringify(options.body),
       cache: "no-store",
+      redirect: "error",
+      signal: controller.signal,
     });
-  } catch {
-    throw new ApiError(0, "Could not reach the messaging service. Check your connection and try again.");
+    const contentType = response.headers.get("content-type") || "";
+    let result;
+    try {
+      result = contentType.includes("json") ? await response.json() : await response.text();
+    } catch {
+      throw new ApiError(response.ok ? 502 : response.status, "The messaging service returned an unreadable response.");
+    }
+    if (!response.ok) {
+      throw new ApiError(response.status, typeof result?.error === "string" ? result.error : `Request failed (${response.status}).`);
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(0, controller.signal.aborted ? "The messaging request timed out. Try again." : "Could not reach the messaging service. Check your connection and try again.");
+  } finally {
+    clearTimeout(timeout);
   }
-
-  const contentType = response.headers.get("content-type") || "";
-  const result = contentType.includes("application/json")
-    ? await response.json().catch(() => ({}))
-    : await response.text().catch(() => "");
-  if (!response.ok) {
-    const message = typeof result === "object" && result?.error
-      ? result.error
-      : `Request failed (${response.status}).`;
-    throw new ApiError(response.status, message);
-  }
-  return result;
 }
 
 function setServiceState(label, state = "") {
+  ui.serviceState.title = label;
   ui.serviceState.className = `service-state ${state}`.trim();
   ui.serviceState.lastElementChild.textContent = label;
 }
@@ -209,14 +273,42 @@ function setConnected(connected) {
 
 function showToast(message, isError = false) {
   clearTimeout(toastTimer);
+  if ($("adminDialog").open) {
+    const notice = $("adminNotice");
+    notice.textContent = message;
+    notice.classList.toggle("is-error", isError);
+    notice.hidden = false;
+    ui.toast.hidden = true;
+    toastTimer = setTimeout(() => { notice.hidden = true; }, 4200);
+    return;
+  }
+  if (ui.profileDialog.open) { ui.profileFeedback.textContent = message; return; }
   ui.toast.textContent = message;
   ui.toast.className = `toast${isError ? " is-error" : ""}`;
   ui.toast.hidden = false;
+  positionToast();
   toastTimer = setTimeout(() => { ui.toast.hidden = true; }, 4200);
 }
 
+function positionToast() {
+  if (ui.toast.hidden) return;
+  const visibleTop = window.visualViewport?.offsetTop || 0;
+  const visibleBottom = visibleTop + (window.visualViewport?.height || window.innerHeight);
+  const anchor = ui.conversation.hidden ? visibleBottom - 18 : ui.composerForm.getBoundingClientRect().top - 10;
+  ui.toast.style.top = `${Math.max(visibleTop + 8, anchor - ui.toast.offsetHeight)}px`;
+  ui.toast.style.bottom = "auto";
+}
+
+if (globalThis.ResizeObserver) new ResizeObserver(positionToast).observe(ui.composerForm);
+window.visualViewport?.addEventListener("resize", () => requestAnimationFrame(positionToast));
+window.visualViewport?.addEventListener("scroll", () => requestAnimationFrame(positionToast));
+
 function avatarLetter(label) {
-  return (label || "?").trim().slice(0, 1).toLocaleUpperCase() || "?";
+  const text = String(label || "?").trim();
+  const first = avatarSegmenter
+    ? avatarSegmenter.segment(text)[Symbol.iterator]().next().value?.segment
+    : Array.from(text)[0];
+  return first?.toLocaleUpperCase() || "?";
 }
 
 function avatarTone(id) {
@@ -239,7 +331,7 @@ function peerByMid(mid) {
 }
 
 function conversationFor(mid) {
-  if (!session.conversations[mid]) {
+  if (!Object.hasOwn(session.conversations, mid) || !session.conversations[mid] || typeof session.conversations[mid] !== "object") {
     session.conversations[mid] = {
       thread: null,
       seq: 0,
@@ -253,16 +345,23 @@ function conversationFor(mid) {
   if (!Array.isArray(conversation.messages)) conversation.messages = [];
   if (!Number.isInteger(conversation.seq)) conversation.seq = 0;
   if (!Number.isInteger(conversation.unread)) conversation.unread = 0;
+  const pending = conversation.pendingSend;
+  if (pending && (pending.body?.to !== mid || typeof pending.key !== "string" || !MESSAGE_TYPES.has(pending.body?.payload?.type)
+    || typeof pending.body?.payload?.text !== "string" || !Number.isInteger(pending.body?.payload?.seq))) conversation.pendingSend = null;
   return conversation;
 }
 
 function ensureThread(conversation) {
   if (!conversation.thread) {
-    const random = globalThis.crypto?.randomUUID?.().replaceAll("-", "")
-      || `${Date.now().toString(16)}${Math.random().toString(16).slice(2)}`;
-    conversation.thread = random.slice(0, 8);
+    conversation.thread = randomId();
   }
   return conversation.thread;
+}
+
+function randomId() {
+  if (globalThis.crypto?.randomUUID) return crypto.randomUUID().replaceAll("-", "");
+  if (globalThis.crypto?.getRandomValues) return Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${Date.now().toString(16)}${Math.random().toString(16).slice(2)}`;
 }
 
 function appendMessage(conversation, message) {
@@ -272,6 +371,7 @@ function appendMessage(conversation, message) {
 
 function renderPeers() {
   if (!session) {
+    peerRenderSignature = "";
     ui.peerList.replaceChildren();
     ui.peerCount.textContent = "0 Pears";
     ui.emptyDirectory.hidden = true;
@@ -279,13 +379,15 @@ function renderPeers() {
   }
   const term = ui.peerSearch.value.trim().toLocaleLowerCase();
   const visible = peers.filter((peer) => `${peer.label} ${peer.mid}`.toLocaleLowerCase().includes(term));
+  const signature = JSON.stringify([term, activePeerMid, visible.map((peer) => [peer.mid, peer.label, conversationFor(peer.mid).unread]), peers.length]);
+  if (signature === peerRenderSignature) return;
+  peerRenderSignature = signature;
   ui.peerList.replaceChildren();
   for (const peer of visible) {
     const conversation = conversationFor(peer.mid);
     const button = document.createElement("button");
     button.type = "button";
     button.className = `peer-button${peer.mid === activePeerMid ? " is-selected" : ""}`;
-    button.setAttribute("role", "listitem");
     button.addEventListener("click", () => selectPeer(peer.mid));
 
     const avatar = document.createElement("span");
@@ -310,7 +412,10 @@ function renderPeers() {
       unread.setAttribute("aria-hidden", "true");
       button.append(unread);
     }
-    ui.peerList.append(button);
+    const item = document.createElement("div");
+    item.setAttribute("role", "listitem");
+    item.append(button);
+    ui.peerList.append(item);
   }
   ui.peerCount.textContent = `${peers.length} ${peers.length === 1 ? "Pear" : "Pears"}`;
   ui.emptyDirectory.hidden = visible.length !== 0;
@@ -324,6 +429,8 @@ function renderPeers() {
 function selectPeer(mid) {
   stopTyping();
   activePeerMid = mid;
+  ui.messageInput.value = conversationFor(mid).draft || "";
+  resizeComposer();
   setRemoteTyping(null);
   sendTypingWatch();
   conversationFor(mid).unread = 0;
@@ -331,7 +438,7 @@ function selectPeer(mid) {
   renderPeers();
   renderConversation();
   closeSidebar();
-  if (window.matchMedia("(min-width: 701px)").matches) ui.messageInput.focus();
+  if (window.matchMedia("(min-width: 681px) and (pointer: fine)").matches) ui.messageInput.focus({ preventScroll: true });
 }
 
 function closeSidebar() {
@@ -376,15 +483,20 @@ function openSidebar() {
   ui.mobileMenu.setAttribute("aria-expanded", "true");
 }
 
-function renderConversation() {
+function renderConversation({ scrollToLatest = false } = {}) {
   const peer = activePeerMid ? peerByMid(activePeerMid) : null;
   ui.welcomePanel.hidden = Boolean(session && peer);
   ui.conversation.hidden = !(session && peer);
   ui.welcomeActionLabel.textContent = session ? "Browse Pears" : "Create a mailbox";
-  if (!session || !peer) return;
+  if (!session || !peer) {
+    renderedPeerMid = null;
+    renderedMessages = [];
+    ui.messageList.replaceChildren();
+    return;
+  }
 
   const conversation = conversationFor(peer.mid);
-  const stickToBottom = ui.messageScroller.scrollHeight - ui.messageScroller.scrollTop - ui.messageScroller.clientHeight < 96;
+  const stickToBottom = scrollToLatest || renderedPeerMid !== peer.mid || ui.messageScroller.scrollHeight - ui.messageScroller.scrollTop - ui.messageScroller.clientHeight < 96;
   ui.chatAvatar.textContent = avatarLetter(peer.label);
   ui.chatPeerName.textContent = peer.label || "Unnamed mailbox";
   ui.chatPeerMid.textContent = peer.mid;
@@ -393,13 +505,25 @@ function renderConversation() {
   ui.threadStatus.innerHTML = "<i></i>";
   ui.threadStatus.append(document.createTextNode(conversation.finished
     ? "Conversation ended"
+    : conversation.replyingFinal
+      ? "Write your final summary"
     : conversation.awaitingFinal
       ? "Waiting for a summary"
       : conversation.messages.length ? "Messages retained for 7 days" : "Waiting for messages"));
   ui.threadStatus.classList.toggle("is-live", !conversation.finished);
-  ui.messageList.replaceChildren();
-
-  for (const message of conversation.messages) {
+  const names = JSON.stringify([peer.label, self?.label]);
+  const appendOnly = renderedPeerMid === peer.mid && names === renderedMessageNames
+    && renderedMessages.length <= conversation.messages.length
+    && renderedMessages.every((message, index) => message === conversation.messages[index]);
+  if (!appendOnly) ui.messageList.replaceChildren();
+  for (const message of conversation.messages.slice(appendOnly ? renderedMessages.length : 0)) {
+    if (message.type === "separator") {
+      const separator = document.createElement("p");
+      separator.className = "conversation-separator";
+      separator.textContent = message.text;
+      ui.messageList.append(separator);
+      continue;
+    }
     const row = document.createElement("article");
     const system = ["final", "done", "abort"].includes(message.type) && !message.mine;
     row.className = `message-row${message.mine ? " mine" : ""}${system ? " system" : ""}`;
@@ -422,19 +546,43 @@ function renderConversation() {
     row.append(meta, bubble);
     ui.messageList.append(row);
   }
+  renderedPeerMid = peer.mid;
+  renderedMessages = conversation.messages.slice();
+  renderedMessageNames = names;
 
   const enabled = !conversation.finished;
+  ui.messageInput.placeholder = conversation.replyingFinal ? "Write your final summary…" : "Write a message…";
+  ui.sendButton.querySelector("span").textContent = conversation.replyingFinal ? "Send summary" : "Send";
   ui.messageInput.disabled = !enabled;
-  ui.messageInput.readOnly = sending;
-  ui.sendButton.disabled = !enabled || sending;
-  ui.summaryButton.disabled = conversation.finished || sending || conversation.awaitingFinal;
-  ui.finishChat.disabled = conversation.finished || sending;
+  const pending = Boolean(conversation.pendingSend);
+  ui.sendButton.disabled = !enabled || sending || pending;
+  ui.sendRecovery.hidden = !pending || sending;
+  ui.retrySend.disabled = sending;
+  ui.newChat.hidden = !conversation.finished;
+  ui.newChat.disabled = sending || pending;
+  ui.summaryButton.hidden = conversation.finished;
+  ui.finishChat.hidden = conversation.finished;
+  ui.summaryButton.disabled = conversation.finished || sending || pending || conversation.awaitingFinal || conversation.replyingFinal;
+  ui.finishChat.disabled = conversation.finished || sending || pending;
   if (stickToBottom) {
-    requestAnimationFrame(() => { ui.messageScroller.scrollTop = ui.messageScroller.scrollHeight; });
+    requestAnimationFrame(() => {
+      if (renderedPeerMid === peer.mid) ui.messageScroller.scrollTo({ top: ui.messageScroller.scrollHeight, behavior: "instant" });
+    });
   }
 }
 
-async function loadPeers() {
+function loadPeers() {
+  if (!session) return Promise.resolve();
+  const generation = sessionGeneration;
+  if (peerLoad?.generation === generation) return peerLoad.promise;
+  const promise = fetchPeers().finally(() => {
+    if (peerLoad?.promise === promise) peerLoad = null;
+  });
+  peerLoad = { generation, promise };
+  return promise;
+}
+
+async function fetchPeers() {
   if (!session) return;
   const generation = sessionGeneration;
   const all = [];
@@ -449,26 +597,37 @@ async function loadPeers() {
     }
     const page = await api(`/v1/agent/peers?${query}`);
     if (generation !== sessionGeneration) return;
-    all.push(...page.peers);
+    if (!Array.isArray(page?.peers)) throw new ApiError(502, "The peer directory returned an invalid response.");
+    all.push(...page.peers.filter((peer) => MAILBOX_ID_PATTERN.test(peer?.mid) && peer.mid !== session.mid)
+      .map((peer) => ({ ...peer, label: typeof peer.label === "string" ? peer.label : peer.mid })));
     cursor = page.next_cursor || null;
   } while (cursor);
-  peers = all;
+  const nextPeers = [...new Map(all.map((peer) => [peer.mid, peer])).values()];
+  // Keep existing conversations reachable even when a peer leaves the directory.
+  for (const mid of Object.keys(session.conversations)) {
+    if (!MAILBOX_ID_PATTERN.test(mid) || nextPeers.some((peer) => peer.mid === mid)) continue;
+    if (session.conversations[mid]?.messages?.length || session.conversations[mid]?.pendingSend) nextPeers.push(peerByMid(mid));
+  }
+  if (JSON.stringify(peers) === JSON.stringify(nextPeers)) return;
+  peers = nextPeers;
   renderPeers();
   renderConversation();
 }
 
 function acceptIncoming(message) {
-  if (!message || typeof message.id !== "string" || session.handled.includes(message.id)) return;
+  if (!message || typeof message.id !== "string" || session.handled.includes(message.id)) return false;
   const payload = message.payload;
   const sender = message.from;
-  if (typeof sender !== "string" || !payload || typeof payload !== "object" || Array.isArray(payload)) return;
+  if (!MAILBOX_ID_PATTERN.test(sender) || !payload || typeof payload !== "object" || Array.isArray(payload)) return false;
   const type = typeof payload.type === "string" ? payload.type : "msg";
-  if (!MESSAGE_TYPES.has(type) || typeof payload.text !== "string") return;
+  if (!MESSAGE_TYPES.has(type) || typeof payload.text !== "string") return false;
 
   const conversation = conversationFor(sender);
   const remoteThread = typeof payload.thread === "string" ? payload.thread : null;
-  if (!conversation.thread && remoteThread) conversation.thread = remoteThread;
-  if (remoteThread && conversation.thread && remoteThread !== conversation.thread) return;
+  const differentThread = remoteThread && conversation.thread && remoteThread !== conversation.thread;
+  if (type === "msg" && (differentThread || conversation.finished)) {
+    beginConversation(conversation, remoteThread || conversation.thread);
+  } else if (!conversation.thread && remoteThread) conversation.thread = remoteThread;
 
   session.handled = [...session.handled, message.id].slice(-1000);
   if (!peers.some((peer) => peer.mid === sender)) peers.push({ mid: sender, label: sender });
@@ -480,18 +639,31 @@ function acceptIncoming(message) {
     ts: message.ts,
     mine: false,
   });
-  if (type === "final" || type === "done" || type === "abort") {
-    conversation.finished = true;
+  if (!differentThread && ["final", "done", "abort"].includes(type)) {
+    conversation.finished = type !== "final";
+    conversation.replyingFinal = type === "final";
     conversation.awaitingFinal = false;
   }
   if (activePeerMid === sender) conversation.unread = 0;
   else conversation.unread += 1;
+  if (activePeerMid === sender) setRemoteTyping(null);
+  if (activePeerMid === sender && conversation.finished) stopTyping();
+  return true;
+}
+
+function beginConversation(conversation, thread = null) {
+  if (conversation.messages.length) appendMessage(conversation, { id: randomId(), type: "separator", text: "New conversation", ts: Date.now() });
+  if (!thread || conversation.thread !== thread) conversation.seq = 0;
+  conversation.thread = thread;
+  conversation.finished = false;
+  conversation.awaitingFinal = false;
+  conversation.replyingFinal = false;
 }
 
 async function pollInbox() {
-  if (!session || pollInFlight) return;
+  if (!session || document.visibilityState === "hidden" || pollingGeneration === sessionGeneration) return;
   const generation = sessionGeneration;
-  pollInFlight = true;
+  pollingGeneration = generation;
   try {
     const seenCursors = new Set();
     let more = true;
@@ -502,28 +674,37 @@ async function pollInbox() {
       const query = new URLSearchParams({ since: priorCursor, limit: "100" });
       const page = await api(`/v1/agent/poll?${query}`);
       if (generation !== sessionGeneration) return;
-      for (const message of page.messages || []) acceptIncoming(message);
+      if (!Array.isArray(page?.messages)) throw new ApiError(502, "The inbox returned an invalid response.");
+      let changed = false;
+      for (const message of page.messages) changed = acceptIncoming(message) || changed;
       session.cursor = String(page.cursor ?? priorCursor);
-      saveSession();
-      renderPeers();
-      if (activePeerMid) renderConversation();
+      if (changed || session.cursor !== priorCursor) saveSession();
+      if (changed) {
+        renderPeers();
+        if (activePeerMid) renderConversation();
+      }
       more = Boolean(page.has_more) && (page.messages || []).length > 0;
       if (session.cursor === priorCursor) more = false;
     }
     setConnectionState("Connected", "is-online");
   } catch (error) {
-    setConnectionState(error.status === 401 ? "Session expired" : "Reconnecting", "is-error");
+    if (generation !== sessionGeneration) return;
+    if (error.status === 401) {
+      clearSession();
+      showToast("Your mailbox session expired. Reconnect with a current bearer token.", true);
+    } else setConnectionState("Reconnecting", "is-error");
   } finally {
-    pollInFlight = false;
+    if (pollingGeneration === generation) pollingGeneration = null;
   }
 }
 
 async function activateMailbox(token, initial = {}) {
   const mailboxMid = initial.mid || token.split(".")[0];
   const tokenRevealUsed = (session?.token === token && Boolean(session.tokenRevealUsed))
-    || sessionStorage.getItem(`${TOKEN_ACCESS_PREFIX}${mailboxMid}`) === "used";
+    || storageGet(`${TOKEN_ACCESS_PREFIX}${mailboxMid}`) === "used";
   const tokenCopyUsed = session?.token === token && Boolean(session.tokenCopyUsed);
-  sessionGeneration += 1;
+  clearSession();
+  const generation = sessionGeneration;
   session = {
     token,
     mid: initial.mid || token.split(".")[0],
@@ -540,13 +721,16 @@ async function activateMailbox(token, initial = {}) {
   setConnected(true);
   let connectionError = null;
   try {
-    self = await api("/v1/agent/self");
+    const identity = await api("/v1/agent/self");
+    if (generation !== sessionGeneration) return;
+    self = identity;
     session.mid = self.mid;
     session.label = self.label;
     saveSession();
     setConnected(true);
     setConnectionState("Connected", "is-online");
   } catch (error) {
+    if (generation !== sessionGeneration) return;
     if (error.status === 401) clearSession();
     if (error.status === 401) throw error;
     connectionError = error;
@@ -557,14 +741,15 @@ async function activateMailbox(token, initial = {}) {
   } catch (error) {
     connectionError ||= error;
   }
+  if (generation !== sessionGeneration) return;
   startPolling();
   if (connectionError) showToast(`Mailbox saved; connection will retry: ${connectionError.message}`, true);
   else showToast(`Connected as ${self.label}.`);
 }
 
 function startPolling() {
-  if (pollTimer) clearInterval(pollTimer);
-  if (peerRefreshTimer) clearInterval(peerRefreshTimer);
+  stopPolling();
+  if (!session || document.visibilityState === "hidden") return;
   pollInbox();
   connectTypingSocket();
   pollTimer = setInterval(pollInbox, POLL_INTERVAL_MS);
@@ -649,6 +834,7 @@ function noteTyping() {
 }
 
 function closeTypingSocket() {
+  typingConnectionGeneration += 1;
   stopTyping();
   if (typingReconnectTimer) clearTimeout(typingReconnectTimer);
   typingReconnectTimer = null;
@@ -659,11 +845,15 @@ function closeTypingSocket() {
 }
 
 async function connectTypingSocket() {
-  if (!session || document.visibilityState === "hidden" || typingSocket || typingReconnectTimer) return;
+  if (!session || document.visibilityState === "hidden" || typingSocket || typingReconnectTimer || typingConnectAttempt) return;
   const generation = sessionGeneration;
+  const connectionGeneration = typingConnectionGeneration;
+  const attempt = {};
+  typingConnectAttempt = attempt;
   try {
     const { mid, ticket } = await api("/presence-ticket", { method: "POST" });
-    if (!session || generation !== sessionGeneration || mid !== session.mid) return;
+    if (!session || generation !== sessionGeneration || connectionGeneration !== typingConnectionGeneration
+      || document.visibilityState === "hidden" || mid !== session.mid) return;
     const endpoint = new URL("/presence", window.location.href);
     endpoint.protocol = endpoint.protocol === "https:" ? "wss:" : "ws:";
     endpoint.search = new URLSearchParams({ mid, ticket }).toString();
@@ -679,7 +869,7 @@ async function connectTypingSocket() {
       if (typingSocket !== socket) return;
       let data;
       try { data = JSON.parse(event.data); } catch { return; }
-      if (data.type === "typing" && data.from === activePeerMid) setRemoteTyping(data.active ? data.from : null);
+      if (data?.type === "typing" && data.from === activePeerMid && typeof data.active === "boolean") setRemoteTyping(data.active ? data.from : null);
     });
     socket.addEventListener("close", () => {
       if (typingSocket !== socket) return;
@@ -690,7 +880,10 @@ async function connectTypingSocket() {
     });
     socket.addEventListener("error", () => socket.close());
   } catch {
-    if (generation === sessionGeneration) scheduleTypingReconnect();
+    if (generation === sessionGeneration && connectionGeneration === typingConnectionGeneration) scheduleTypingReconnect();
+  } finally {
+    if (typingConnectAttempt === attempt) typingConnectAttempt = null;
+    if (connectionGeneration !== typingConnectionGeneration && session && !typingSocket) scheduleTypingReconnect();
   }
 }
 
@@ -703,60 +896,81 @@ function scheduleTypingReconnect() {
   }, delay);
 }
 
-async function sendMessage(text, type = "msg") {
+async function sendMessage(text, type = "msg", retry = false) {
   if (!session || !activePeerMid || sending) return false;
   const conversation = conversationFor(activePeerMid);
   const generation = sessionGeneration;
   const peerMid = activePeerMid;
-  const restoreComposerFocus = ui.composerForm.contains(document.activeElement);
-  if (conversation.finished) return false;
-  const thread = ensureThread(conversation);
-  const seq = conversation.seq;
-  const key = `${thread}-h${seq}`;
+  const submittedDraft = ui.messageInput.value;
+  if (type === "msg" && conversation.replyingFinal) type = "done";
+  if (conversation.pendingSend && !retry) {
+    showToast("Retry the unconfirmed message before sending another.", true);
+    return false;
+  }
+  if (conversation.finished && !retry) return false;
+  if (!conversation.pendingSend) {
+    const thread = ensureThread(conversation);
+    const seq = conversation.seq;
+    conversation.pendingSend = {
+      key: `${thread}-h${seq}`,
+      body: { to: peerMid, payload: { thread, seq, type, text } },
+      draft: submittedDraft,
+      revision: conversation.draftRevision || 0,
+    };
+    saveSession();
+  }
+  const pending = conversation.pendingSend;
+  const payload = pending.body.payload;
   sending = true;
   renderConversation();
   try {
     const accepted = await api("/v1/agent/send", {
       method: "POST",
-      idempotencyKey: key,
-      body: {
-        to: activePeerMid,
-        payload: { thread, seq, type, text },
-      },
+      idempotencyKey: pending.key,
+      body: pending.body,
     });
     if (generation !== sessionGeneration) return false;
-    appendMessage(conversation, {
+    if (typeof accepted?.id !== "string" || !Number.isFinite(accepted.ts)) throw new ApiError(502, "Message acceptance could not be confirmed. Retry the saved message.");
+    // Incoming IDs belong to our mailbox; accepted IDs belong to the peer's.
+    // Only an earlier outgoing message can be a duplicate of this acceptance.
+    if (!conversation.messages.some((message) => message.mine && message.id === accepted.id)) appendMessage(conversation, {
       id: accepted.id,
-      type,
-      text,
+      type: payload.type,
+      text: payload.text,
       ts: accepted.ts,
       mine: true,
     });
-    conversation.seq += 1;
-    if (type === "final") conversation.awaitingFinal = true;
-    if (type === "done") conversation.finished = true;
+    if (conversation.thread === payload.thread) {
+      conversation.seq = Math.max(conversation.seq, payload.seq + 1);
+      if (payload.type === "final") conversation.awaitingFinal = true;
+      if (payload.type === "done") { conversation.finished = true; conversation.replyingFinal = false; }
+    }
+    if (activePeerMid === peerMid && conversation.finished) stopTyping();
+    if (["msg", "done"].includes(payload.type) && (conversation.draftRevision || 0) === (pending.revision || 0) && (conversation.draft || "") === pending.draft) {
+      conversation.draft = "";
+      if (activePeerMid === peerMid && ui.messageInput.value === pending.draft) ui.messageInput.value = "";
+    }
+    conversation.pendingSend = null;
     saveSession();
-    if (type === "msg") ui.messageInput.value = "";
     resizeComposer();
-    renderConversation();
-    ui.messageInput.focus();
+    renderConversation({ scrollToLatest: activePeerMid === peerMid });
     return true;
   } catch (error) {
+    if (generation !== sessionGeneration) return false;
+    if (error.status >= 400 && error.status < 500 && ![408, 409, 429].includes(error.status)) {
+      conversation.pendingSend = null;
+      saveSession();
+    }
     if (error.status === 409) {
-      showToast("That retry key is already tied to a different message. Please start a fresh chat.", true);
+      showToast("The saved request conflicts with a previous send. Sign out and reconnect to reconcile the mailbox.", true);
     } else {
       showToast(error.message, true);
     }
     return false;
   } finally {
-    sending = false;
-    renderConversation();
-    const focusTarget = document.activeElement;
-    if (restoreComposerFocus
-      && activePeerMid === peerMid
-      && !conversation.finished
-      && (focusTarget === document.body || ui.composerForm.contains(focusTarget))) {
-      ui.messageInput.focus();
+    if (generation === sessionGeneration) {
+      sending = false;
+      renderConversation();
     }
   }
 }
@@ -780,6 +994,7 @@ $("joinForm").addEventListener("submit", async (event) => {
   const formElement = event.currentTarget;
   const form = new FormData(formElement);
   const label = String(form.get("label") || "").trim();
+  if (!label) { showToast("Enter your name to create a mailbox.", true); $("joinLabel").focus(); return; }
   const secret = String(form.get("join_secret") || "");
   const button = $("joinButton");
   button.disabled = true;
@@ -825,11 +1040,14 @@ $("localSignOut").addEventListener("click", () => {
 
 $("leaveMailbox").addEventListener("click", async () => {
   if (!confirm("Delete this mailbox and permanently erase its messages? This cannot be undone.")) return;
+  const generation = sessionGeneration;
   try {
     await api("/v1/agent/leave", { method: "POST" });
+    if (generation !== sessionGeneration) return;
     clearSession();
     showToast("Mailbox deleted.");
   } catch (error) {
+    if (generation !== sessionGeneration) return;
     showToast(error.message, true);
   }
 });
@@ -845,13 +1063,17 @@ $("copyMid").addEventListener("click", async () => {
 
 ui.copyBearerToken.addEventListener("click", async () => {
   if (!session || !session.tokenCopyWindowOpen || session.tokenCopyUsed || !ui.profileDialog.open) return;
+  const generation = sessionGeneration;
+  const token = session.token;
   try {
-    await navigator.clipboard.writeText(session.token);
+    await navigator.clipboard.writeText(token);
+    if (generation !== sessionGeneration) return;
     session.tokenCopyUsed = true;
     saveSession();
     ui.copyBearerToken.disabled = true;
     ui.profileFeedback.textContent = "Bearer token copied. Keep it private.";
   } catch {
+    if (generation !== sessionGeneration) return;
     ui.profileFeedback.textContent = "Could not access the clipboard.";
   }
 });
@@ -861,7 +1083,7 @@ ui.revealToken.addEventListener("click", () => {
   ui.bearerTokenValue.textContent = session.token;
   session.tokenRevealUsed = true;
   session.tokenCopyWindowOpen = true;
-  sessionStorage.setItem(`${TOKEN_ACCESS_PREFIX}${session.mid}`, "used");
+  storageSet(`${TOKEN_ACCESS_PREFIX}${session.mid}`, "used");
   saveSession();
   ui.revealToken.disabled = true;
   ui.revealToken.textContent = "Shown once";
@@ -879,8 +1101,14 @@ ui.profileDialog.addEventListener("close", () => {
   ui.copyBearerToken.disabled = true;
 });
 ui.profileDialog.addEventListener("click", (event) => {
-  if (event.target === ui.profileDialog) closeProfileDialog();
+  if (isBackdropClick(event, ui.profileDialog)) closeProfileDialog();
 });
+
+function isBackdropClick(event, dialog) {
+  if (event.target !== dialog) return false;
+  const rect = dialog.getBoundingClientRect();
+  return event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom;
+}
 
 $("refreshPeers").addEventListener("click", async () => {
   try {
@@ -893,6 +1121,14 @@ $("refreshPeers").addEventListener("click", async () => {
 
 ui.peerSearch.addEventListener("input", renderPeers);
 
+// Keep focus on the editable textarea throughout the tap and the network call.
+// Focusing again after await is too late to keep iOS's keyboard open.
+ui.sendButton.addEventListener("pointerdown", (event) => {
+  if (!event.isPrimary || event.button !== 0 || ui.sendButton.disabled) return;
+  event.preventDefault();
+  ui.messageInput.focus({ preventScroll: true });
+});
+
 ui.composerForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   stopTyping();
@@ -902,25 +1138,57 @@ ui.composerForm.addEventListener("submit", async (event) => {
     showToast("This message is larger than the API's 64 KiB payload limit.", true);
     return;
   }
+  ui.messageInput.focus({ preventScroll: true });
   await sendMessage(text);
 });
 
 ui.messageInput.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey) {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
     event.preventDefault();
     ui.composerForm.requestSubmit();
   }
 });
 ui.messageInput.addEventListener("input", () => {
+  if (session && activePeerMid) {
+    const conversation = conversationFor(activePeerMid);
+    conversation.draft = ui.messageInput.value;
+    conversation.draftRevision = (conversation.draftRevision || 0) + 1;
+    scheduleSessionSave();
+  }
   resizeComposer();
   noteTyping();
 });
 
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "hidden") closeTypingSocket();
-  else if (session) connectTypingSocket();
+  if (document.visibilityState === "hidden") {
+    saveSession();
+    stopPolling();
+    closeTypingSocket();
+  } else if (session) {
+    startPolling();
+    loadPeers().catch(() => {});
+    refreshService();
+  }
 });
-window.addEventListener("pagehide", stopTyping);
+window.addEventListener("pagehide", () => { saveSession(); stopPolling(); closeTypingSocket(); });
+window.addEventListener("pageshow", (event) => { if (event.persisted && session) startPolling(); });
+
+ui.retrySend.addEventListener("click", () => {
+  if (!session || !activePeerMid) return;
+  ui.messageInput.focus({ preventScroll: true });
+  sendMessage("", "msg", true);
+});
+ui.retrySend.addEventListener("pointerdown", (event) => {
+  if (event.isPrimary && event.button === 0) { event.preventDefault(); ui.messageInput.focus({ preventScroll: true }); }
+});
+ui.newChat.addEventListener("click", () => {
+  if (!session || !activePeerMid || sending) return;
+  const conversation = conversationFor(activePeerMid);
+  if (conversation.pendingSend) return;
+  beginConversation(conversation);
+  saveSession();
+  renderConversation();
+});
 
 ui.summaryButton.addEventListener("click", () => {
   sendMessage("Please wrap up and write the final summary of our conversation.", "final");
@@ -936,9 +1204,7 @@ ui.mobileMenu.addEventListener("click", () => {
 });
 
 ui.themeToggle.addEventListener("click", () => {
-  themePreference = themePreference === "system"
-    ? (systemTheme.matches ? "light" : "dark")
-    : "system";
+  themePreference = nextThemePreference();
   try {
     localStorage.setItem(THEME_STORAGE_KEY, themePreference);
   } catch {}
@@ -960,25 +1226,27 @@ document.addEventListener("keydown", (event) => {
 async function boot() {
   refreshService();
   if (!session) return;
-  const saved = session;
+  const generation = sessionGeneration;
   try {
-    self = await api("/v1/agent/self");
+    const identity = await api("/v1/agent/self");
+    if (generation !== sessionGeneration) return;
+    self = identity;
     session.mid = self.mid;
     session.label = self.label;
     saveSession();
     setConnected(true);
     setConnectionState("Connected", "is-online");
   } catch (error) {
-    session = saved;
+    if (generation !== sessionGeneration) return;
     if (error.status === 401) {
       clearSession();
       showToast("Saved mailbox token is no longer valid. Reconnect with a current token.", true);
       return;
     }
-    setConnected(Boolean(self));
+    self = { mid: session.mid, label: session.label };
+    setConnected(true);
     setConnectionState("Reconnecting", "is-error");
     showToast(error.message, true);
-    return;
   }
   let warning = null;
   try {
@@ -986,6 +1254,7 @@ async function boot() {
   } catch (error) {
     warning = error;
   }
+  if (generation !== sessionGeneration) return;
   startPolling();
   if (warning) showToast(`Directory unavailable: ${warning.message}`, true);
 }
@@ -1001,6 +1270,18 @@ const registryContent = $("registryContent");
 let adminSecret = "";
 let adminAgentsCursor = null;
 let adminRegistries = {};
+let adminSavedRegistries = {};
+let adminRegistryResource = $("registryType").value;
+let adminRegistriesLoaded = false;
+let adminRegistryLoad = null;
+let adminGeneration = 0;
+let adminDetailGeneration = 0;
+let adminListGeneration = 0;
+let adminSaving = false;
+
+function currentAdmin(generation) {
+  return generation === adminGeneration && Boolean(adminSecret);
+}
 
 function adminPath(resource) {
   return `/v1/admin/registry/${resource}`;
@@ -1017,10 +1298,21 @@ function openAdminConsole() {
 }
 
 function lockAdminConsole() {
+  adminGeneration += 1;
+  adminDetailGeneration += 1;
   adminSecret = "";
+  $("adminNotice").hidden = true;
   adminDialog.classList.remove("is-unlocked");
   adminAgentsCursor = null;
   adminRegistries = {};
+  adminSavedRegistries = {};
+  adminRegistriesLoaded = false;
+  adminSaving = false;
+  registryContent.value = "";
+  registryContent.disabled = true;
+  $("saveRegistry").disabled = true;
+  $("adminLoginButton").disabled = false;
+  $("loadMoreAgents").hidden = true;
   adminLoginForm.hidden = false;
   adminContent.hidden = true;
   $("adminSignOut").hidden = true;
@@ -1032,15 +1324,20 @@ function lockAdminConsole() {
 }
 
 async function loadAdminAgents(cursor = null, append = false) {
+  const generation = adminGeneration;
+  const listGeneration = ++adminListGeneration;
   const query = new URLSearchParams({ limit: "100" });
   if (cursor) query.set("cursor", cursor);
   const page = await api(`/v1/admin/agents?${query}`, { auth: false, adminSecret });
+  if (!currentAdmin(generation) || listGeneration !== adminListGeneration) return;
   if (!append) adminAgentList.replaceChildren();
   for (const agent of page.agents || []) {
     const item = document.createElement("button");
     item.type = "button";
     item.className = "admin-agent-item";
     item.dataset.mid = agent.mid;
+    const listItem = document.createElement("div");
+    listItem.setAttribute("role", "listitem");
     const identity = document.createElement("span");
     identity.className = "admin-agent-identity";
     const name = document.createElement("strong");
@@ -1050,9 +1347,10 @@ async function loadAdminAgents(cursor = null, append = false) {
     identity.append(name, mid);
     const joined = document.createElement("span");
     joined.className = "admin-agent-date";
-    joined.textContent = new Date(Number(agent.joined_at)).toLocaleDateString();
+    joined.textContent = new Date(Number(agent.joined_at ?? agent.created_at)).toLocaleDateString();
     item.append(identity, joined);
-    adminAgentList.append(item);
+    listItem.append(item);
+    adminAgentList.append(listItem);
   }
   adminAgentsCursor = page.next_cursor || null;
   $("loadMoreAgents").hidden = !adminAgentsCursor;
@@ -1070,9 +1368,12 @@ function addAdminDetailRow(parent, label, value) {
 }
 
 async function showAdminAgent(mid) {
+  const generation = adminGeneration;
+  const detailGeneration = ++adminDetailGeneration;
   adminAgentDetail.innerHTML = '<p class="admin-empty">Loading mailbox…</p>';
   try {
     const agent = await api(`/v1/admin/agents/${encodeURIComponent(mid)}`, { auth: false, adminSecret });
+    if (!currentAdmin(generation) || detailGeneration !== adminDetailGeneration) return;
     const card = document.createElement("div");
     card.className = "admin-agent-record";
     const heading = document.createElement("div");
@@ -1097,13 +1398,16 @@ async function showAdminAgent(mid) {
     remove.className = "primary-button admin-delete-button";
     remove.textContent = "Delete mailbox";
     remove.addEventListener("click", async () => {
+      if (!currentAdmin(generation)) return;
       if (!confirm(`Delete ${agent.label || agent.mid} and permanently erase its inbox?`)) return;
       remove.disabled = true;
       try {
         await api(`/v1/admin/agents/${encodeURIComponent(agent.mid)}`, { method: "DELETE", auth: false, adminSecret });
-        adminAgentDetail.innerHTML = '<p class="admin-empty">Mailbox deleted and inbox erased.</p>';
+        if (!currentAdmin(generation)) return;
+        if (detailGeneration === adminDetailGeneration) adminAgentDetail.innerHTML = '<p class="admin-empty">Mailbox deleted and inbox erased.</p>';
         await loadAdminAgents();
       } catch (error) {
+        if (!currentAdmin(generation)) return;
         remove.disabled = false;
         showToast(error.message, true);
       }
@@ -1111,6 +1415,7 @@ async function showAdminAgent(mid) {
     card.append(remove);
     adminAgentDetail.replaceChildren(card);
   } catch (error) {
+    if (!currentAdmin(generation) || detailGeneration !== adminDetailGeneration) return;
     adminAgentDetail.innerHTML = "";
     const message = document.createElement("p");
     message.className = "admin-empty is-error";
@@ -1119,7 +1424,17 @@ async function showAdminAgent(mid) {
   }
 }
 
-async function loadAdminRegistries() {
+function loadAdminRegistries() {
+  const generation = adminGeneration;
+  if (adminRegistryLoad?.generation === generation) return adminRegistryLoad.promise;
+  const promise = fetchAdminRegistries(generation).finally(() => {
+    if (adminRegistryLoad?.promise === promise) adminRegistryLoad = null;
+  });
+  adminRegistryLoad = { generation, promise };
+  return promise;
+}
+
+async function fetchAdminRegistries(generation) {
   const [capabilities, guide, policy, client] = await Promise.all([
     api("/v1/public/capabilities", { auth: false }),
     api("/v1/public/guide", { auth: false }),
@@ -1129,24 +1444,33 @@ async function loadAdminRegistries() {
       throw error;
     }),
   ]);
+  if (!currentAdmin(generation)) return;
   adminRegistries = {
     capabilities: JSON.stringify(capabilities.capabilities || [], null, 2),
     guide,
     policy,
     client,
   };
+  adminSavedRegistries = { ...adminRegistries };
+  adminRegistriesLoaded = true;
   showRegistryEditor();
 }
 
 function showRegistryEditor() {
-  registryContent.value = adminRegistries[$("registryType").value] || "";
-  setAdminFeedback($("registryFeedback"), "");
+  adminRegistryResource = $("registryType").value;
+  registryContent.value = adminRegistries[adminRegistryResource] || "";
+  registryContent.disabled = !adminRegistriesLoaded;
+  $("saveRegistry").disabled = !adminRegistriesLoaded || adminSaving;
+  setAdminFeedback($("registryFeedback"), adminRegistriesLoaded
+    ? (registryContent.value !== adminSavedRegistries[adminRegistryResource] ? "Unsaved changes" : "")
+    : "Resources unavailable. Select Registries again to retry.");
 }
 
 $("openAdminButton").addEventListener("click", openAdminConsole);
 
 adminLoginForm.addEventListener("submit", async (event) => {
   event.preventDefault();
+  const generation = ++adminGeneration;
   const secret = String(new FormData(adminLoginForm).get("secret") || "").trim();
   const button = $("adminLoginButton");
   button.disabled = true;
@@ -1154,7 +1478,7 @@ adminLoginForm.addEventListener("submit", async (event) => {
   try {
     adminSecret = secret;
     await loadAdminAgents();
-    await loadAdminRegistries();
+    if (!currentAdmin(generation)) return;
     adminLoginForm.reset();
     adminLoginForm.hidden = true;
     adminDialog.classList.add("is-unlocked");
@@ -1163,11 +1487,17 @@ adminLoginForm.addEventListener("submit", async (event) => {
     $("adminAgentsPane").hidden = false;
     $("adminRegistriesPane").hidden = true;
     document.querySelectorAll(".admin-tab").forEach((tab) => tab.classList.toggle("is-active", tab.dataset.adminTab === "agents"));
+    loadAdminRegistries().catch((error) => {
+      if (!currentAdmin(generation)) return;
+      showRegistryEditor();
+      showToast(`Registry resources unavailable: ${error.message}`, true);
+    });
   } catch (error) {
+    if (generation !== adminGeneration) return;
     adminSecret = "";
     setAdminFeedback($("adminLoginFeedback"), error.status === 401 ? "The admin secret was not accepted." : error.message, true);
   } finally {
-    button.disabled = false;
+    if (generation === adminGeneration) button.disabled = false;
   }
 });
 
@@ -1182,33 +1512,50 @@ document.querySelectorAll(".admin-tab").forEach((tab) => tab.addEventListener("c
   $("adminAgentsPane").hidden = !agents;
   $("adminRegistriesPane").hidden = agents;
   document.querySelectorAll(".admin-tab").forEach((candidate) => candidate.classList.toggle("is-active", candidate === tab));
+  if (!agents && !adminRegistriesLoaded) {
+    const generation = adminGeneration;
+    loadAdminRegistries().catch((error) => { if (currentAdmin(generation)) showToast(error.message, true); });
+  }
 }));
-$("registryType").addEventListener("change", showRegistryEditor);
+$("registryType").addEventListener("change", () => {
+  if (adminRegistriesLoaded) adminRegistries[adminRegistryResource] = registryContent.value;
+  showRegistryEditor();
+});
+registryContent.addEventListener("input", () => {
+  adminRegistries[adminRegistryResource] = registryContent.value;
+  setAdminFeedback($("registryFeedback"), registryContent.value !== adminSavedRegistries[adminRegistryResource] ? "Unsaved changes" : "");
+});
 $("saveRegistry").addEventListener("click", async () => {
+  if (!adminSecret || !adminRegistriesLoaded || adminSaving) return;
+  const generation = adminGeneration;
   const resource = $("registryType").value;
+  const submitted = registryContent.value;
   let body;
   if (resource === "capabilities") {
     try {
-      body = { capabilities: JSON.parse(registryContent.value) };
+      body = { capabilities: JSON.parse(submitted) };
       if (!Array.isArray(body.capabilities)) throw new Error("Capabilities must be a JSON array.");
     } catch (error) {
       setAdminFeedback($("registryFeedback"), error.message || "Enter valid JSON.", true);
       return;
     }
   } else {
-    body = { [resource === "client" ? "source" : "markdown"]: registryContent.value };
+    body = { [resource === "client" ? "source" : "markdown"]: submitted };
   }
   const button = $("saveRegistry");
   button.disabled = true;
+  adminSaving = true;
   setAdminFeedback($("registryFeedback"), "Saving…");
   try {
     const result = await api(adminPath(resource), { method: "POST", body, auth: false, adminSecret });
-    adminRegistries[resource] = registryContent.value;
-    setAdminFeedback($("registryFeedback"), `Saved${result.version ? ` · version ${result.version}` : ""}.`);
+    if (!currentAdmin(generation)) return;
+    adminSavedRegistries[resource] = submitted;
+    if (adminRegistryResource === resource) setAdminFeedback($("registryFeedback"),
+      adminRegistries[resource] === submitted ? `Saved${result.version ? ` · version ${result.version}` : ""}.` : "Previous version saved. New edits are unsaved.");
   } catch (error) {
-    setAdminFeedback($("registryFeedback"), error.message, true);
+    if (currentAdmin(generation) && adminRegistryResource === resource) setAdminFeedback($("registryFeedback"), error.message, true);
   } finally {
-    button.disabled = false;
+    if (currentAdmin(generation)) { adminSaving = false; button.disabled = !adminRegistriesLoaded; }
   }
 });
 
@@ -1216,5 +1563,5 @@ $("adminSignOut").addEventListener("click", lockAdminConsole);
 $("closeAdmin").addEventListener("click", () => adminDialog.close());
 adminDialog.addEventListener("close", lockAdminConsole);
 adminDialog.addEventListener("click", (event) => {
-  if (event.target === adminDialog) adminDialog.close();
+  if (isBackdropClick(event, adminDialog)) adminDialog.close();
 });

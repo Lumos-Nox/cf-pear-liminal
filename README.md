@@ -48,7 +48,7 @@ To deploy the browser app, run `npx wrangler@latest deploy` from this project fo
 
 On desktop, hover over the brand icon to reveal the **Admin** button. Enter the admin secret to inspect and delete mailboxes or edit the public service registries. The Admin button is hidden on mobile.
 
-The interface follows the device's color-scheme preference by default, with a manual light/dark toggle. While composing, a lightweight WebSocket typing signal drives the animated three-dot message bubble; it sends no per-keystroke HTTP requests. If both Pears type at once, a small shared-moment animation appears.
+The appearance button cycles through system, light, and dark modes. While composing, a lightweight WebSocket typing signal drives the animated three-dot message bubble; it sends no per-keystroke HTTP requests. If both Pears type at once, a small shared-moment animation appears.
 
 ### Two Pears chatting in the browser
 
@@ -78,8 +78,9 @@ The app follows Cloudflare's current [Static Assets](https://developers.cloudfla
 
 **Reliability:**
 - CLI state is saved atomically with mode 0600 after every step. The browser UI keeps equivalent mailbox and conversation state in the current tab's `sessionStorage`.
-- Network errors and 429/5xx responses are retried with backoff.
-- Sends use idempotency keys, so a resend after a crash returns the original message instead of delivering it twice. A 409 means the key was reused with a different request and is treated as an error.
+- CLI sends retry network errors and 408/429/5xx responses with backoff. The browser retains unconfirmed sends and offers **Retry message** before another send. A retry preserves the original payload and key, including after refresh, while retaining newer draft text.
+- Sends use idempotency keys, so a resend after a crash returns the original message instead of delivering it twice. A 409 means the key was reused with a different request and is treated as an error. Python clients persist a local inbox with its poll cursor and acknowledge messages only after recording them; pending agent replies resume without regenerating their text.
+- Background browser tabs pause polling and reconnect when visible. Empty polls leave the existing chat DOM intact. Drafts save after a short debounce and when the tab is hidden.
 - Peer discovery follows every `next_cursor` page, and polling persists the response `cursor` for the next `since` request.
 
 ## API contract
@@ -138,6 +139,7 @@ In `clients/human.py`:
 | text + Enter | send a message (end a line with `\` to continue on the next line) |
 | `/end` | ask the agent for a final summary, save it, and both sides exit |
 | `/quit` or Ctrl-D | tell the agent you left; both sides exit |
+| `/retry` | resend the exact unconfirmed request, preserving its idempotency key |
 | `/help` | list commands |
 | Ctrl-C | leave silently; rerun with the same `--state` to continue |
 
@@ -162,7 +164,7 @@ The default `<out>` is `artifacts/` for the bridge and `chat/` for the human cli
 | `--topic`, `--persona` | n/a | shown on every turn |
 | `--context FILE` | none | repeatable; the agent's **only** source of facts |
 | `--start TEXT` | none | set on exactly one side |
-| `--model` | `claude-sonnet-4.5` | e.g. `claude-haiku-4.5` for cheap, fast runs |
+| `--model` | `claude-haiku-4.5` | Override with another model available in your Kiro CLI. |
 | `--duration-min` / `--max-turns` | 60 / 40 | upper limits before wrap-up |
 | `--stall` | 4 | wrap up after this many messages with an unchanged agreed list |
 | `--history` | 16 | recent messages per prompt |

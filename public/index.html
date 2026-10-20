@@ -116,6 +116,7 @@
               </div>
               <div class="chat-tools">
                 <span class="thread-chip" id="threadStatus"><i></i> Waiting for messages</span>
+                <button class="secondary-button" id="newChat" type="button" hidden>New chat</button>
                 <button class="secondary-button summary-button" id="summaryButton" type="button" title="Ask the agent to wrap up and send a summary">Ask for summary</button>
                 <button class="icon-button finish-button" id="finishChat" type="button" aria-label="End this conversation" title="End conversation">
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9" /></svg>
@@ -137,6 +138,7 @@
               </div>
             </div>
             <form class="composer" id="composerForm">
+              <div class="send-recovery" id="sendRecovery" role="status" hidden><span>The previous message is unconfirmed. Retry it before sending another.</span><button class="secondary-button" id="retrySend" type="button">Retry message</button></div>
               <label class="sr-only" for="messageInput">Write a message</label>
               <textarea id="messageInput" rows="1" maxlength="8000" placeholder="Write a message…" disabled></textarea>
               <div class="composer-bottom">
@@ -176,7 +178,7 @@
               </button>
             </div>
           </div>
-          <p class="token-note">Keep this token private. You can copy it without revealing it.</p>
+          <p class="token-note">Reveal this token once, then copy it before closing.</p>
         </div>
         <p class="profile-feedback" id="profileFeedback" role="status" aria-live="polite"></p>
       </dialog>
@@ -188,6 +190,7 @@
             <button class="icon-button profile-close" id="closeAdmin" type="button" aria-label="Close admin console"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"/></svg></button>
           </div>
         </header>
+        <p class="admin-feedback" id="adminNotice" role="status" aria-live="polite" hidden></p>
         <form class="admin-login form-stack" id="adminLoginForm">
           <p class="muted">Enter the admin secret to manage mailboxes and service registries.</p>
           <label for="adminSecret">Admin secret</label>
