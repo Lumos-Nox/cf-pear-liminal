@@ -1,0 +1,46 @@
+# iOS reliability and experience review
+
+Reviewed the SwiftUI app, Worker proxy/presence service, browser client and styles, Python bridge and terminal client, deployment configuration, and project documentation. Implementation changes for this review are in the native client and its local test tooling.
+
+## Correctness and security fixes
+
+- Namespace sent IDs by recipient and received IDs separately. The API's monotonic IDs are inbox-local; using the raw ID globally could silently hide an incoming note after sending to another inbox.
+- Bind Keychain tokens and protected history files to a normalized server origin. Server changes disconnect and invalidate the old session before making more requests. Reject URL credentials, paths, queries, fragments, and public cleartext HTTP. Local HTTP supports RFC1918 IPv4 LAN ranges, link-local addresses, IPv6 ULA/link-local, loopback, and `.local` hosts. ATS exceptions are limited to these local address ranges.
+- Reject credential-bearing redirects, disable URL caches and persistent cookies, and preserve cancellation as cancellation.
+- Check session, admin, and inspection identities after asynchronous work. Late responses cannot repopulate a signed-out mailbox, reopen a locked console, or replace another mailbox's inspection.
+- Persist pending sends before HTTP delivery. A timeout or ambiguous response keeps the original key, payload, thread, and sequence for explicit retry, including after relaunch. Encode JSON with sorted keys so retry bytes stay stable. An HTTP 200 without a message ID remains unconfirmed.
+- Decode arbitrary/non-chat JSON payloads without poisoning the entire inbox page. Guard numeric conversions against out-of-range values. Enforce the payload limit after JSON encoding.
+- Keep a newly issued token in memory if its initial Keychain write fails, so the user can retry secure storage without creating another mailbox. Add Face ID and local-network usage descriptions. Check Keychain deletion errors. Keep destructive mailbox actions behind confirmation and erase local history after successful deletion without re-saving it during sign-out.
+- Keep an authenticated token-copy operation pending through Face ID’s temporary inactive state, then write text using UIKit’s automatic pasteboard representation on reactivation. Cancel authorization on actual backgrounding or session changes.
+- Clear operator form secrets on leaving the foreground. Disable registry editing/saving until resources load. Failed mailbox inspection has a retry state.
+
+## UI and efficiency
+
+- Two primary tabs: Mailbox and Settings. The operator console is under Settings and locks on dismissal.
+- A restrained green palette, serif welcome typography, native grouped surfaces, rounded avatars, and a floating Liquid Glass capsule composer with a separate 48-point circular send button and no backing bar.
+- Searchable conversations, recent-message previews, drafts, unread counts, activity ordering, and useful empty and reconnect states. Local conversations remain discoverable after a peer leaves the directory.
+- Outgoing notes appear without a sending label or spinner. Queued and active sends do not show an unconfirmed warning in the transcript or mailbox preview; unfinished attempts and restored outbox entries retain an explicit retry action. Delivery-state regressions cover queueing, active requests, retry, cancellation, restoration and sign-out. Drafts survive navigation and session restoration.
+- Queued and confirmed notes use the same bubble typography, wrapping, padding, corner radius and grouping. A persisted client identity keeps the row stable on acknowledgement while its light pending fill and text color transition to the sent colors over 0.22 seconds (without animation for Reduce Motion). Older history remains decodable.
+- Message long presses use a native edit menu anchored to the bubble, without a lifted preview or dimmed conversation backdrop. Copy and Share note have accessible actions; sharing anchors its system sheet to the bubble on iPad. Menus are allocated only when requested.
+- The self-mailbox card shows creation date, local conversation/note/unread totals and available capabilities. Counts follow local history rather than stale server snapshots, and metrics stack at accessibility text sizes.
+- Mailbox IDs display consistently as `m-` plus the first six characters after the original prefix, including Settings and the operator console. Full IDs remain the underlying conversation and API keys. The name field reads Your name.
+- A single Done action closes and locks the operator console.
+- The native chat container constrains the transcript above a separate composer, whose bottom tracks `UIKeyboardLayoutGuide`. Embedded SwiftUI views disable their own keyboard safe areas; notification-driven scroll repairs and competing SwiftUI anchors are removed. Viewport resizing updates its offset in the same layout transaction. Short threads are bottom aligned without rubber-banding; downward swipes can still dismiss the keyboard. Transcript measurements are cached across draft edits. These interactions still require device verification.
+- The entire padded composer capsule focuses its text field, including its empty area.
+- The composer uses a native multiline editor with explicit width-based hosting measurements. It grows to four lines (including wrapped text and trailing newlines), then scrolls internally; its corners decrease toward a 16-point radius. Send reads committed native input and clears UIKit, its undo history and the saved draft immediately after successful queueing, without waiting for delivery or clearing subsequent input. The offscreen UIKit regression tool checks editor and hosted-container sizing, width changes and late editing callbacks; real keyboard/IME interaction remains a device check.
+- Name, mailbox-token, join-secret, admin-secret and API-address inputs share a plain field style and consistent row heights that scale with Dynamic Type. The text region includes its padding in the focus target; focusing does not change the row height.
+- Create mailbox, Open mailbox and Unlock use theme-colored capsule arrow controls inside the right edge of their password fields, with accessible action labels and preserved validation/loading states. Submitting dismisses field focus; the arrow tap does not also focus the input.
+- Connection and operator-unlock screens use top-aligned scrollable content with separate capsule fields instead of grouped rows and separators. A 60-point field and 44-point arrow leave an even 8-point inset; disabled arrows retain theme-colored contrast. Layout scrolls for the keyboard and larger text, and presents the existing server address as a quiet caption rather than a separate card.
+- Field text has a 20-point leading inset. Save API address dismisses its keyboard and turns gray when the validated address matches the saved setting; focusing the address field restores the action's theme color.
+- Both launch stages use the same 64-point PNG artwork with continuous corners baked into alpha at 1×, 2× and 3×. The native storyboard has a new resource name, and the timed opening screen remains one second.
+- New-message affordance while reading older notes, keyboard dismissal, Reduce Motion-aware scrolling, scalable content typography, text selection, and note sharing.
+- Poll all foreground inbox conversations; refresh peers periodically, avoid overlapping polls, back off after failures, and cancel polling outside the foreground. No push endpoint is available.
+- Encode and write history off the main actor, debounce draft saves, skip unchanged inbox writes, keep the latest 500 messages per peer, and reject older queued disk snapshots. Rapid reconnect waits for the prior session's final save.
+
+## Verification and remaining device checks
+
+Automated tests cover ID collisions, origin validation, malformed payloads, numeric overflow, cancellation, request retries and stable bodies, pending-message restoration, late responses, repeated cursors, local deletion, server/mailbox cache separation, and disk-write ordering. The Postman simulation exercises the real Swift model and URLSession over local HTTP, including an ambiguous send, idempotent replay, redirect refusal, and HTML errors.
+
+No iOS simulator runtime is installed on this Mac. The unsigned iPhone build validates compilation; it does not validate visual layout or interaction. Before release, check an iPhone and iPad in light/dark mode, large accessibility text, VoiceOver, keyboard and rotation, reading older messages as new ones arrive, Face ID/canceled authentication, airplane mode/recovery, and background/foreground transitions. Actual Keychain/file-protection behavior and live backend integration still require device verification.
+
+Messages use iOS file protection, not end-to-end encryption. Sign-out keeps local history for reconnecting; Delete mailbox erases this client's associated cache. Legacy outgoing history migrates from UserDefaults only for the original production origin. A legacy unscoped token is adopted only when the app launched with the production origin; custom-server users should explicitly reconnect with their token.
