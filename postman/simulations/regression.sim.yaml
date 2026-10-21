@@ -1,0 +1,5 @@
+simulation: pear-liminal-regression
+routing: path
+mocks:
+  - routeKey: messaging
+    path: ../mocks/agent-messaging/config.yaml

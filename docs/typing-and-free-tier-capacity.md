@@ -12,7 +12,7 @@ For each signed-in browser tab in the foreground, the UI currently makes:
 | Peer refresh (`GET /v1/agent/peers`) | 15 seconds | 4 | 5,760 |
 | **Steady-state total** | — | **24** | **34,560** |
 
-This excludes initial health, identity, directory, and presence-ticket requests; user sends; and extra pages when a poll or peer listing has more results. The 24 requests/minute is approximately **0.4 requests/second per signed-in tab**. The API's documented 6,000 authenticated requests/minute per mailbox is not the first constraint at this rate.
+This excludes initial health, identity, directory, and presence-ticket requests; user sends; and extra pages when a poll or peer listing has more results. Hidden tabs now pause inbox and directory polling and close their typing socket; becoming visible triggers an immediate refresh. An already-running request may finish after the tab is hidden. The table therefore describes active foreground time, not all time a tab remains open. The 24 requests/minute is approximately **0.4 requests/second per signed-in tab**. The API's documented 6,000 authenticated requests/minute per mailbox is not the first constraint at this rate.
 
 The Python clients also poll the messaging API directly. Their defaults are 3 seconds for `clients/human.py` (20 polls/minute) and 5 seconds for `clients/bridge.py` (12 polls/minute). Add those processes to the account's overall usage when they run.
 
