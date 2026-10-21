@@ -39,7 +39,7 @@ xcrun swiftc -parse-as-library -target arm64-apple-ios17.0-macabi \
 /tmp/pear-composer-check
 ```
 
-This checks wrapped lines, explicit and trailing newlines, the four-line cap, larger type, width changes, and clearing without restoring the old draft. Keyboard gestures and IME interaction still require an iPhone check.
+This checks wrapped lines, explicit and trailing newlines, the four-line cap, larger type, width changes, and clearing without restoring the old draft. It also checks invalid keyboard-guide frames and repeated background/resume cycles with temporary zero-sized views, preserving the draft and older-message reading position. Actual Home-screen/keyboard transitions, keyboard gestures and IME interaction still require an iPhone check.
 
 ## Notes
 

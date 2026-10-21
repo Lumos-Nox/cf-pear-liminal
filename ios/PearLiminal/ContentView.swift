@@ -56,6 +56,7 @@ private struct PearAvatar: View {
 private struct MailboxSummaryCard: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dynamicTypeSize) private var typeSize
+    @State private var copyFeedbackID: UUID?
     let mailbox: SelfMailbox
 
     private var conversationCount: Int {
@@ -71,7 +72,20 @@ private struct MailboxSummaryCard: View {
                 VStack(alignment: .leading, spacing: 5) {
                     Text(mailbox.label.isEmpty ? "Your mailbox" : mailbox.label)
                         .font(.title3.weight(.semibold))
-                    Text(mailbox.mid.shortMID).font(.caption.monospaced()).foregroundStyle(.secondary)
+                    Button {
+                        UIPasteboard.general.string = mailbox.mid
+                        copyFeedbackID = UUID()
+                    } label: {
+                        Label(copyFeedbackID == nil ? mailbox.mid.shortMID : "Copied",
+                              systemImage: copyFeedbackID == nil ? "doc.on.doc" : "checkmark")
+                            .font(.caption.monospaced())
+                            .foregroundStyle(copyFeedbackID == nil ? Color.secondary : PearTheme.accent)
+                            .frame(minHeight: 44, alignment: .leading)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Copy full mailbox ID")
+                    .accessibilityValue(copyFeedbackID == nil ? mailbox.mid : "Copied")
                     if mailbox.createdAt > 0 {
                         Text("Created \(Date(timeIntervalSince1970: Double(mailbox.createdAt) / 1000).formatted(date: .abbreviated, time: .omitted))")
                             .font(.caption).foregroundStyle(.secondary)
@@ -79,7 +93,7 @@ private struct MailboxSummaryCard: View {
                 }
                 Spacer(minLength: 0)
             }
-            .accessibilityElement(children: .combine)
+            .accessibilityElement(children: .contain)
 
             if typeSize.isAccessibilitySize {
                 VStack(alignment: .leading, spacing: 14) { metrics }
@@ -96,6 +110,13 @@ private struct MailboxSummaryCard: View {
             }
         }
         .padding(.vertical, 8)
+        .onChange(of: mailbox.mid) { _, _ in copyFeedbackID = nil }
+        .task(id: copyFeedbackID) {
+            guard copyFeedbackID != nil else { return }
+            do { try await Task.sleep(for: .seconds(2)) }
+            catch { return }
+            copyFeedbackID = nil
+        }
     }
 
     @ViewBuilder private var metrics: some View {
@@ -105,11 +126,12 @@ private struct MailboxSummaryCard: View {
     }
 
     private func metric(_ title: String, value: Int) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .center, spacing: 4) {
             Text(value.formatted()).font(.title3.weight(.semibold)).monospacedDigit()
             Text(title).font(.caption).foregroundStyle(.secondary)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .center)
+        .multilineTextAlignment(.center)
         .accessibilityElement(children: .combine)
     }
 }
@@ -414,7 +436,8 @@ struct MailboxView: View {
     }
 
     private func mailboxHome(_ mailbox: SelfMailbox) -> some View {
-        List {
+        let peers = visiblePeers
+        return List {
             Section {
                 MailboxSummaryCard(mailbox: mailbox)
                     .listRowInsets(EdgeInsets(top: 14, leading: 16, bottom: 14, trailing: 16))
@@ -422,34 +445,55 @@ struct MailboxView: View {
             if let warning = model.mailboxConnectionWarning {
                 Section { ConnectionNotice(text: warning) }
             }
-            Section {
-                if visiblePeers.isEmpty {
+            if peers.isEmpty {
+                Section {
                     ContentUnavailableView(search.isEmpty ? "A little quiet here" : "No matching Pears", systemImage: search.isEmpty ? "person.2" : "magnifyingglass", description: Text(search.isEmpty ? "New mailboxes appear automatically. Pull down to refresh." : "Try another name or mailbox ID."))
                         .listRowBackground(Color.clear)
+                } header: {
+                    conversationsHeader(count: 0)
+                } footer: {
+                    conversationsFooter
                 }
-                ForEach(visiblePeers) { peer in
-                    NavigationLink { ChatView(peer: peer) } label: { peerRow(peer) }
-                        .listRowInsets(EdgeInsets(top: 14, leading: 16, bottom: 14, trailing: 16))
-                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                            Button(role: .destructive) {
-                                model.deleteConversation(peer.mid)
-                            } label: {
-                                Label("Delete", systemImage: "trash")
+            } else {
+                ForEach(peers) { peer in
+                    // A single-row section has four rounded corners before
+                    // swiping; UIKit need not morph grouped edge-row corners.
+                    Section {
+                        NavigationLink { ChatView(peer: peer) } label: { peerRow(peer) }
+                            .listRowInsets(EdgeInsets(top: 14, leading: 16, bottom: 14, trailing: 16))
+                            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                Button(role: .destructive) {
+                                    model.deleteConversation(peer.mid)
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                                .disabled(!model.canDeleteConversation(peer.mid))
                             }
-                            .disabled(!model.canDeleteConversation(peer.mid))
-                        }
+                    } header: {
+                        if peer.mid == peers.first?.mid { conversationsHeader(count: peers.count) }
+                    } footer: {
+                        if peer.mid == peers.last?.mid { conversationsFooter }
+                    }
                 }
-            } header: {
-                HStack {
-                    Text("Conversations")
-                    Spacer()
-                    if model.isRefreshingPeers { ProgressView().controlSize(.mini) }
-                    else { Text(visiblePeers.count.formatted()).monospacedDigit() }
-                }
-            } footer: { Text("Messages stay on the service for 7 days. The latest 500 notes per conversation are kept on this iPhone.") }
+            }
         }
+        .listStyle(.insetGrouped)
+        .listSectionSpacing(10)
         .searchable(text: $search, prompt: "Find a Pear")
         .refreshable { await model.refreshPeers(); await model.refreshInbox() }
+    }
+
+    private func conversationsHeader(count: Int) -> some View {
+        HStack {
+            Text("Conversations")
+            Spacer()
+            if model.isRefreshingPeers { ProgressView().controlSize(.mini) }
+            else { Text(count.formatted()).monospacedDigit() }
+        }
+    }
+
+    private var conversationsFooter: some View {
+        Text("Messages stay on the service for 7 days. The latest 500 notes per conversation are kept on this iPhone.")
     }
 
     private func peerRow(_ peer: Peer) -> some View {
@@ -476,14 +520,21 @@ struct MailboxView: View {
                         .foregroundStyle(deliveryUnconfirmed ? Color.orange : Color.secondary)
                         .lineLimit(2)
                     Spacer(minLength: 4)
-                    if unread > 0 {
+                    // Reserve the largest badge's footprint even when read,
+                    // so unread changes cannot alter preview wrapping or height.
+                    ZStack {
+                        Text("99+").hidden()
                         Text(unread > 99 ? "99+" : "\(unread)")
-                            .font(.caption2.bold()).monospacedDigit()
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 7).padding(.vertical, 4)
-                            .background(PearTheme.ink, in: Capsule())
-                            .accessibilityLabel("\(unread) unread messages")
                     }
+                    .font(.caption2.bold()).monospacedDigit()
+                    .fixedSize()
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 7).padding(.vertical, 4)
+                    .background(PearTheme.ink, in: Capsule())
+                    .opacity(unread > 0 ? 1 : 0)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("\(unread) unread messages")
+                    .accessibilityHidden(unread == 0)
                 }
                 if !peer.label.isEmpty { Text(peer.mid.shortMID).font(.caption2.monospaced()).foregroundStyle(.tertiary) }
             }

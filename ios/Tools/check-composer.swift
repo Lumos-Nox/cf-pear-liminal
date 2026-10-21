@@ -88,7 +88,58 @@ import UIKit
         viewport.view.frame.size.width = 700
         let wideHeight = height(rotatingText)
         precondition(wideHeight < narrowHeight, "Width changes must remeasure wrapping")
+
+        let safeArea = CGRect(x: 0, y: 44, width: 390, height: 766)
+        for invalidGuide in [CGRect.zero, CGRect(x: 0, y: 0, width: 390, height: 844),
+                             CGRect(x: 0, y: 400, width: 390, height: 0)] {
+            precondition(!ConversationViewportController.keyboardGuideIsUsable(
+                invalidGuide, safeArea: safeArea, composerHeight: 68),
+                "A suspended or incomplete keyboard frame must use the safe bottom anchor")
+        }
+        for validGuide in [CGRect(x: 0, y: 810, width: 390, height: 34),
+                           CGRect(x: 0, y: 500, width: 390, height: 344)] {
+            precondition(ConversationViewportController.keyboardGuideIsUsable(
+                validGuide, safeArea: safeArea, composerHeight: 68),
+                "Valid hidden and visible keyboard guides must remain usable")
+        }
+
+        viewport.view.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+        let savedDraft = "A draft that survives backgrounding"
+        let restoredHeight = height(savedDraft)
+        for _ in 0..<3 {
+            viewport.setScenePhase(.background)
+            viewport.view.frame = .zero
+            viewport.view.layoutIfNeeded()
+            viewport.setScenePhase(.inactive)
+            viewport.view.layoutIfNeeded()
+            viewport.view.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+            viewport.setScenePhase(.active)
+            viewport.view.layoutIfNeeded()
+            let composerFrame = viewport.view.subviews[1].frame
+            precondition(composerFrame.height == restoredHeight, "Resume must restore the composer height")
+            precondition(abs(composerFrame.maxY - viewport.view.safeAreaLayoutGuide.layoutFrame.maxY) < 1,
+                         "Resume must anchor the composer at the bottom, without re-entering the chat")
+            precondition(control.committedText(fallback: "") == savedDraft, "Resume must preserve the draft")
+        }
+
+        let scrollView = viewport.view.subviews[0] as! UIScrollView
+        viewport.update(contentVersion: ["long transcript"], latestRequest: 1,
+                        transcript: { _ in AnyView(Color.clear.frame(height: 1800)) },
+                        composer: composer(savedDraft), onFollowChange: { _ in })
+        viewport.view.layoutIfNeeded()
+        scrollView.contentOffset.y = 350
+        viewport.scrollViewDidEndDragging(scrollView, willDecelerate: false)
+        viewport.setScenePhase(.background)
+        viewport.view.frame = .zero
+        viewport.view.layoutIfNeeded()
+        viewport.setScenePhase(.inactive)
+        viewport.view.layoutIfNeeded()
+        viewport.view.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+        viewport.setScenePhase(.active)
+        viewport.view.layoutIfNeeded()
+        precondition(abs(scrollView.contentOffset.y - 350) < 1, "Resume must preserve the older-message reading position")
         print("Hosted composer heights: \(oneLine), \(twoLines), \(fourLines), \(sixLines)")
+        print("Background/resume, keyboard guide, draft and reading-position checks passed.")
         print("Composer checks passed. Line heights: \(heights), wrapped: \(wrapped)")
     }
 }

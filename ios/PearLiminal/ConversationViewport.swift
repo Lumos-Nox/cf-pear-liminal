@@ -4,6 +4,7 @@ import UIKit
 /// One layout owner for the keyboard, transcript and composer. The editor is a
 /// sibling of the scroll view, so focusing it cannot scroll the transcript.
 struct ConversationViewport<Transcript: View, Composer: View>: UIViewControllerRepresentable {
+    @Environment(\.scenePhase) private var scenePhase
     let contentVersion: [String]
     let latestRequest: Int
     let transcript: (CGFloat) -> Transcript
@@ -15,6 +16,7 @@ struct ConversationViewport<Transcript: View, Composer: View>: UIViewControllerR
     }
 
     func updateUIViewController(_ controller: ConversationViewportController, context: Context) {
+        controller.setScenePhase(scenePhase)
         controller.update(contentVersion: contentVersion, latestRequest: latestRequest,
                           transcript: { AnyView(transcript($0)) }, composer: AnyView(composer),
                           onFollowChange: onFollowChange)
@@ -32,6 +34,9 @@ final class ConversationViewportController: UIViewController, UIScrollViewDelega
     private var needsMeasurement = true
     private var onFollowChange: ((Bool) -> Void)?
     private var composerHeight: NSLayoutConstraint!
+    private var keyboardBottom: NSLayoutConstraint!
+    private var restingBottom: NSLayoutConstraint!
+    private var scenePhase: ScenePhase = .active
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -67,6 +72,8 @@ final class ConversationViewportController: UIViewController, UIScrollViewDelega
 
         let safeArea = view.safeAreaLayoutGuide
         view.keyboardLayoutGuide.usesBottomSafeArea = true
+        keyboardBottom = composerHost.view.bottomAnchor.constraint(equalTo: view.keyboardLayoutGuide.topAnchor)
+        restingBottom = composerHost.view.bottomAnchor.constraint(equalTo: safeArea.bottomAnchor)
         NSLayoutConstraint.activate([
             composerHeight,
             scrollView.topAnchor.constraint(equalTo: safeArea.topAnchor),
@@ -76,7 +83,7 @@ final class ConversationViewportController: UIViewController, UIScrollViewDelega
             scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 0),
             composerHost.view.leadingAnchor.constraint(equalTo: safeArea.leadingAnchor),
             composerHost.view.trailingAnchor.constraint(equalTo: safeArea.trailingAnchor),
-            composerHost.view.bottomAnchor.constraint(equalTo: view.keyboardLayoutGuide.topAnchor),
+            restingBottom,
         ])
 
         // A short transcript has nothing to scroll or rubber-band. Still allow
@@ -86,6 +93,44 @@ final class ConversationViewportController: UIViewController, UIScrollViewDelega
         dismiss.cancelsTouchesInView = false
         dismiss.delegate = self
         scrollView.addGestureRecognizer(dismiss)
+    }
+
+    func setScenePhase(_ phase: ScenePhase) {
+        loadViewIfNeeded()
+        guard scenePhase != phase else { return }
+        let wasBackgrounded = scenePhase == .background
+        scenePhase = phase
+        scrollView.setLayoutSuspended(phase == .background)
+        if wasBackgrounded && phase != .background {
+            needsMeasurement = true
+        }
+        updateComposerAnchor()
+        view.setNeedsLayout()
+    }
+
+    /// A disappearing window can temporarily leave the keyboard guide at the
+    /// origin. Never let that invalid frame pull the composer to the top.
+    static func keyboardGuideIsUsable(_ frame: CGRect, safeArea: CGRect, composerHeight: CGFloat) -> Bool {
+        guard frame.minY.isFinite, frame.maxY.isFinite,
+              safeArea.width > 0, safeArea.height > 0 else { return false }
+        return frame.minY >= safeArea.minY + composerHeight
+            && frame.minY <= safeArea.maxY + 1
+            && frame.maxY >= safeArea.maxY - 1
+    }
+
+    @discardableResult private func updateComposerAnchor() -> Bool {
+        let followKeyboard = scenePhase != .background && Self.keyboardGuideIsUsable(
+            view.keyboardLayoutGuide.layoutFrame, safeArea: view.safeAreaLayoutGuide.layoutFrame,
+            composerHeight: composerHeight.constant)
+        guard keyboardBottom.isActive != followKeyboard else { return false }
+        if followKeyboard {
+            restingBottom.isActive = false
+            keyboardBottom.isActive = true
+        } else {
+            keyboardBottom.isActive = false
+            restingBottom.isActive = true
+        }
+        return true
     }
 
     func update(contentVersion: [String], latestRequest: Int, transcript: @escaping (CGFloat) -> AnyView,
@@ -110,6 +155,10 @@ final class ConversationViewportController: UIViewController, UIScrollViewDelega
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
+        // The guide has its updated frame only after UIKit lays out the view.
+        // Resolve the anchor in this transaction, including on foregrounding.
+        if updateComposerAnchor() { view.layoutIfNeeded() }
+        guard scenePhase != .background, view.bounds.width > 0, view.bounds.height > 0 else { return }
         let composerWidth = composerHost.view.bounds.width
         if composerWidth > 0 {
             let size = composerHost.sizeThatFits(in: CGSize(width: composerWidth, height: .greatestFiniteMagnitude))
@@ -143,7 +192,7 @@ final class ConversationViewportController: UIViewController, UIScrollViewDelega
     func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) { observeUserScroll(ending: true) }
 
     private func observeUserScroll(ending: Bool = false) {
-        guard !scrollView.isApplyingLayout,
+        guard scenePhase != .background, !scrollView.isApplyingLayout,
               ending || scrollView.isDragging || scrollView.isDecelerating else { return }
         let previous = scrollView.scrollState.followsLatest
         scrollView.scrollState.observeScroll(isNearBottom: ConversationScrollState.isNearBottom(
@@ -169,11 +218,24 @@ private final class ConversationScrollView: UIScrollView {
     var scrollState = ConversationScrollState()
     private(set) var isApplyingLayout = false
     var needsBottomAlignment = true
+    private var isLayoutSuspended = false
+    private var savedReadingOffset: CGFloat?
+
+    func setLayoutSuspended(_ suspended: Bool) {
+        guard isLayoutSuspended != suspended else { return }
+        if suspended { savedReadingOffset = contentOffset.y }
+        isLayoutSuspended = suspended
+        if !suspended {
+            needsBottomAlignment = true
+            setNeedsLayout()
+        }
+    }
 
     override var bounds: CGRect {
         get { super.bounds }
         set {
-            guard newValue.height != super.bounds.height else { super.bounds = newValue; return }
+            guard !isLayoutSuspended, newValue.width > 0, newValue.height > 0,
+                  newValue.height != super.bounds.height else { super.bounds = newValue; return }
             // Change viewport size and offset together, within the keyboard's
             // own animation transaction. No notification, delay or scrollTo.
             let wasApplyingLayout = isApplyingLayout
@@ -182,7 +244,7 @@ private final class ConversationScrollView: UIScrollView {
             var adjusted = newValue
             adjusted.origin.y = ConversationScrollState.offsetAfterResize(
                 contentHeight: contentSize.height, viewportHeight: newValue.height,
-                offset: super.bounds.minY, followsLatest: scrollState.followsLatest)
+                offset: savedReadingOffset ?? super.bounds.minY, followsLatest: scrollState.followsLatest)
             super.bounds = adjusted
             needsBottomAlignment = true
         }
@@ -203,6 +265,7 @@ private final class ConversationScrollView: UIScrollView {
         isApplyingLayout = true
         defer { isApplyingLayout = wasApplyingLayout }
         super.layoutSubviews()
+        guard !isLayoutSuspended, bounds.width > 0, bounds.height > 0 else { return }
         let top = ConversationScrollState.topInset(contentHeight: contentSize.height, viewportHeight: bounds.height)
         if contentInset.top != top { contentInset = UIEdgeInsets(top: top, left: 0, bottom: 0, right: 0) }
         bounces = contentSize.height > bounds.height
@@ -210,7 +273,8 @@ private final class ConversationScrollView: UIScrollView {
             needsBottomAlignment = false
             let offset = ConversationScrollState.offsetAfterResize(
                 contentHeight: contentSize.height, viewportHeight: bounds.height,
-                offset: contentOffset.y, followsLatest: scrollState.followsLatest)
+                offset: savedReadingOffset ?? contentOffset.y, followsLatest: scrollState.followsLatest)
+            savedReadingOffset = nil
             if contentOffset.y != offset { contentOffset.y = offset }
         }
     }
