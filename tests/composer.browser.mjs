@@ -38,13 +38,15 @@ try {
     assert.deepEqual(state, { focused: true, editable: true, sameNode: true, blurred: false });
   }
   async function waitForSend(page) {
-    await page.waitForFunction(() => !document.querySelector("#sendButton").disabled);
+    await page.waitForFunction(() => !document.querySelector('#messageList [data-delivery="queued"], #messageList [data-delivery="unconfirmed"]'));
   }
 
   const page = await openMailbox();
   await page.locator("#messageInput").fill("Send by touch");
   await page.locator("#sendButton").tap();
-  assert.equal(await page.locator("#sendButton").isDisabled(), true);
+  assert.equal(await page.locator("#sendButton").isDisabled(), false);
+  assert.equal(await page.locator("#messageInput").inputValue(), "");
+  assert.equal(await page.locator(".message-bubble").last().textContent(), "Send by touch");
   await assertEditing(page);
   await waitForSend(page);
   assert.equal(await page.locator("#messageInput").inputValue(), "");
@@ -61,7 +63,7 @@ try {
 
   await page.locator("#messageInput").fill("Send by Enter");
   await page.locator("#messageInput").press("Enter");
-  assert.equal(await page.locator("#sendButton").isDisabled(), true);
+  assert.equal(await page.locator("#sendButton").isDisabled(), false);
   await assertEditing(page);
   await waitForSend(page);
   await assertEditing(page);
@@ -70,7 +72,7 @@ try {
 
   await page.locator("#messageInput").fill("Previous message");
   await page.locator("#sendButton").tap();
-  assert.equal(await page.locator("#sendButton").isDisabled(), true);
+  assert.equal(await page.locator("#sendButton").isDisabled(), false);
   await page.locator("#messageInput").fill("Next draft typed while sending");
   await waitForSend(page);
   assert.equal(await page.locator("#messageInput").inputValue(), "Next draft typed while sending");
@@ -114,10 +116,11 @@ try {
   const failed = await openMailbox("fault-send");
   await failed.locator("#messageInput").fill("Keep this failed message");
   await failed.locator("#sendButton").tap();
-  assert.equal(await failed.locator("#sendButton").isDisabled(), true);
+  assert.equal(await failed.locator("#sendButton").isDisabled(), false);
   await assertEditing(failed);
   await failed.locator("#sendRecovery").waitFor({ state: "visible" });
-  assert.equal(await failed.locator("#messageInput").inputValue(), "Keep this failed message");
+  assert.equal(await failed.locator("#messageInput").inputValue(), "");
+  assert.equal(await failed.locator(".message-bubble").last().textContent(), "Keep this failed message");
   await assertEditing(failed);
   assert.equal(await failed.locator("#toast.is-error").isVisible(), true);
   if (process.env.COMPOSER_SCREENSHOT) {

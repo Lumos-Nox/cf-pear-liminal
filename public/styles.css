@@ -182,6 +182,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
 .message-row.mine .message-meta { justify-content: flex-end; }
 .message-meta strong { color: #536458; font-weight: 650; }
 .message-kind { padding: 2px 5px; color: #83513f; background: #f3e4d9; border-radius: 4px 7px 7px 7px; font-size: 9px; text-transform: uppercase; letter-spacing: .06em; }
+.message-delivery { color: var(--coral); font-size: 11px; }
 .message-bubble { max-width: 100%; padding: 11px 14px; color: #344239; background: #f2f3ee; border: 1px solid #ebede7; border-radius: 4px 15px 15px 15px; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; white-space: pre-wrap; }
 .message-row.mine .message-bubble { color: var(--action-ink); background: var(--action-bg); border-color: var(--action-bg); border-radius: 15px 4px 15px 15px; }
 .message-row.system .message-bubble { color: #744c40; background: #faf0ea; border-color: #f0e3da; }

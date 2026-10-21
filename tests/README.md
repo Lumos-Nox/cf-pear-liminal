@@ -64,6 +64,17 @@ repeated sends in a long conversation. The browser uses the same
 optional `PLAYWRIGHT_MODULE` and `CHROME_EXECUTABLE` settings. Physical Safari
 keyboard behavior and device-specific viewport reporting remain unverified.
 
+To check the saved, non-blocking send queue against the same simulation:
+
+```sh
+SIMULATION_URL=http://127.0.0.1:4499 node tests/outbox.browser.mjs
+```
+
+This verifies immediate transcript updates and composer clearing, rapid submissions,
+ordered delivery to each peer, independent delivery to other peers, stable bubble
+identity on acknowledgement, exact retries across reload, migration of older saved
+requests, and isolation from signed-out sessions.
+
 ## Full non-iOS audit checks
 
 The browser audit covers exact send recovery across refresh, message DOM stability,
@@ -84,7 +95,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 SIMULATION_URL=http://127.0.0.1:4499 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-Run HTTP suites sequentially against the shared simulation: audit and Python checks
+Run HTTP suites sequentially against the shared simulation: browser and Python checks
 reset its synthetic state through `/simulation/*`. Those control endpoints exist
 only in the local fixture. The browser audit uses the same optional Playwright and
 Chrome settings as the other browser scripts. `AUDIT_SCREENSHOT` and

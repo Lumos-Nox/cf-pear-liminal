@@ -89,6 +89,7 @@ function nextThemePreference() {
 applyThemePreference();
 trackAppViewport();
 
+const preparedConversations = new WeakSet();
 let session = readSession();
 let self = null;
 let peers = [];
@@ -101,9 +102,10 @@ let saveTimer = null;
 let storageWarningShown = false;
 let renderedPeerMid = null;
 let renderedMessages = [];
+const renderedMessageRows = new Map();
 let renderedMessageNames = "";
 let peerRenderSignature = "";
-let sending = false;
+const activeSends = new Map();
 let toastTimer = null;
 let sessionGeneration = 0;
 let typingSocket = null;
@@ -133,6 +135,11 @@ function readSession() {
     if (storageGet(`${TOKEN_ACCESS_PREFIX}${saved.mid}`) === "used") saved.tokenRevealUsed = true;
     saved.conversations = saved.conversations && typeof saved.conversations === "object" && !Array.isArray(saved.conversations)
       ? saved.conversations : {};
+    // The first saved request may have reached the service before the tab closed.
+    // Keep later notes queued behind its explicit, idempotent retry.
+    for (const conversation of Object.values(saved.conversations)) {
+      if (Array.isArray(conversation?.outbox) && conversation.outbox[0]) conversation.outbox[0].status = "unconfirmed";
+    }
     return saved;
   } catch {
     storageRemove(STORAGE_KEY);
@@ -188,7 +195,7 @@ function clearSession() {
   self = null;
   peers = [];
   activePeerMid = null;
-  sending = false;
+  activeSends.clear();
   ui.messageInput.value = "";
   ui.peerSearch.value = "";
   resizeComposer();
@@ -345,10 +352,32 @@ function conversationFor(mid) {
   if (!Array.isArray(conversation.messages)) conversation.messages = [];
   if (!Number.isInteger(conversation.seq)) conversation.seq = 0;
   if (!Number.isInteger(conversation.unread)) conversation.unread = 0;
-  const pending = conversation.pendingSend;
-  if (pending && (pending.body?.to !== mid || typeof pending.key !== "string" || !MESSAGE_TYPES.has(pending.body?.payload?.type)
-    || typeof pending.body?.payload?.text !== "string" || !Number.isInteger(pending.body?.payload?.seq))) conversation.pendingSend = null;
+  if (!preparedConversations.has(conversation)) {
+    const valid = (pending) => pending?.body?.to === mid && typeof pending.key === "string"
+      && MESSAGE_TYPES.has(pending.body?.payload?.type) && typeof pending.body.payload.text === "string"
+      && Number.isInteger(pending.body.payload.seq) && typeof pending.body.payload.thread === "string";
+    conversation.outbox = Array.isArray(conversation.outbox) ? conversation.outbox.filter(valid) : [];
+    const legacy = conversation.pendingSend;
+    if (valid(legacy) && !conversation.outbox.some((pending) => pending.key === legacy.key)) {
+      conversation.outbox.unshift({ ...legacy, status: "unconfirmed" });
+      if (conversation.draft === legacy.draft && (conversation.draftRevision || 0) === (legacy.revision || 0)) conversation.draft = "";
+    }
+    delete conversation.pendingSend;
+    for (const pending of conversation.outbox) {
+      const payload = pending.body.payload;
+      if (payload.thread === conversation.thread) conversation.seq = Math.max(conversation.seq, payload.seq + 1);
+      if (!conversation.messages.some((message) => message.clientId === pending.key)) {
+        appendMessage(conversation, outgoingMessage(pending));
+      }
+    }
+    preparedConversations.add(conversation);
+  }
   return conversation;
+}
+
+function outgoingMessage(pending) {
+  return { id: `local-${pending.key}`, clientId: pending.key, type: pending.body.payload.type,
+    text: pending.body.payload.text, ts: pending.ts || Date.now(), mine: true, pending: true };
 }
 
 function ensureThread(conversation) {
@@ -366,7 +395,16 @@ function randomId() {
 
 function appendMessage(conversation, message) {
   conversation.messages.push(message);
-  if (conversation.messages.length > 500) conversation.messages.splice(0, conversation.messages.length - 500);
+  trimMessages(conversation);
+}
+
+function trimMessages(conversation) {
+  // An unsent note must remain visible and recoverable even in a long queue.
+  while (conversation.messages.length > 500) {
+    const index = conversation.messages.findIndex((message) => !message.pending);
+    if (index < 0) break;
+    conversation.messages.splice(index, 1);
+  }
 }
 
 function renderPeers() {
@@ -491,6 +529,7 @@ function renderConversation({ scrollToLatest = false } = {}) {
   if (!session || !peer) {
     renderedPeerMid = null;
     renderedMessages = [];
+    renderedMessageRows.clear();
     ui.messageList.replaceChildren();
     return;
   }
@@ -515,7 +554,10 @@ function renderConversation({ scrollToLatest = false } = {}) {
   const appendOnly = renderedPeerMid === peer.mid && names === renderedMessageNames
     && renderedMessages.length <= conversation.messages.length
     && renderedMessages.every((message, index) => message === conversation.messages[index]);
-  if (!appendOnly) ui.messageList.replaceChildren();
+  if (!appendOnly) {
+    ui.messageList.replaceChildren();
+    renderedMessageRows.clear();
+  }
   for (const message of conversation.messages.slice(appendOnly ? renderedMessages.length : 0)) {
     if (message.type === "separator") {
       const separator = document.createElement("p");
@@ -544,7 +586,24 @@ function renderConversation({ scrollToLatest = false } = {}) {
     bubble.className = "message-bubble";
     bubble.textContent = message.text;
     row.append(meta, bubble);
+    if (message.clientId) {
+      row.dataset.clientId = message.clientId;
+      const delivery = document.createElement("span");
+      delivery.className = "message-delivery";
+      delivery.textContent = "Delivery unconfirmed";
+      delivery.hidden = true;
+      row.append(delivery);
+      renderedMessageRows.set(message, row);
+    }
     ui.messageList.append(row);
+  }
+  const unconfirmed = new Set(conversation.outbox.filter((pending) => pending.status === "unconfirmed").map((pending) => pending.key));
+  for (const [message, row] of renderedMessageRows) {
+    const delivery = !message.pending ? "confirmed" : unconfirmed.has(message.clientId) ? "unconfirmed" : "queued";
+    if (row.dataset.delivery === delivery) continue;
+    row.dataset.delivery = delivery;
+    row.querySelector(".message-delivery").hidden = delivery !== "unconfirmed";
+    if (delivery === "confirmed") row.querySelector("time").textContent = formatTime(message.ts);
   }
   renderedPeerMid = peer.mid;
   renderedMessages = conversation.messages.slice();
@@ -554,16 +613,15 @@ function renderConversation({ scrollToLatest = false } = {}) {
   ui.messageInput.placeholder = conversation.replyingFinal ? "Write your final summary…" : "Write a message…";
   ui.sendButton.querySelector("span").textContent = conversation.replyingFinal ? "Send summary" : "Send";
   ui.messageInput.disabled = !enabled;
-  const pending = Boolean(conversation.pendingSend);
-  ui.sendButton.disabled = !enabled || sending || pending;
-  ui.sendRecovery.hidden = !pending || sending;
-  ui.retrySend.disabled = sending;
+  ui.sendButton.disabled = !enabled;
+  ui.sendRecovery.hidden = unconfirmed.size === 0;
+  ui.retrySend.disabled = activeSends.has(peer.mid);
   ui.newChat.hidden = !conversation.finished;
-  ui.newChat.disabled = sending || pending;
+  ui.newChat.disabled = false;
   ui.summaryButton.hidden = conversation.finished;
   ui.finishChat.hidden = conversation.finished;
-  ui.summaryButton.disabled = conversation.finished || sending || pending || conversation.awaitingFinal || conversation.replyingFinal;
-  ui.finishChat.disabled = conversation.finished || sending || pending;
+  ui.summaryButton.disabled = conversation.finished || conversation.awaitingFinal || conversation.replyingFinal;
+  ui.finishChat.disabled = conversation.finished;
   if (stickToBottom) {
     requestAnimationFrame(() => {
       if (renderedPeerMid === peer.mid) ui.messageScroller.scrollTo({ top: ui.messageScroller.scrollHeight, behavior: "instant" });
@@ -606,7 +664,7 @@ async function fetchPeers() {
   // Keep existing conversations reachable even when a peer leaves the directory.
   for (const mid of Object.keys(session.conversations)) {
     if (!MAILBOX_ID_PATTERN.test(mid) || nextPeers.some((peer) => peer.mid === mid)) continue;
-    if (session.conversations[mid]?.messages?.length || session.conversations[mid]?.pendingSend) nextPeers.push(peerByMid(mid));
+    if (session.conversations[mid]?.messages?.length || conversationFor(mid).outbox.length) nextPeers.push(peerByMid(mid));
   }
   if (JSON.stringify(peers) === JSON.stringify(nextPeers)) return;
   peers = nextPeers;
@@ -896,81 +954,83 @@ function scheduleTypingReconnect() {
   }, delay);
 }
 
-async function sendMessage(text, type = "msg", retry = false) {
-  if (!session || !activePeerMid || sending) return false;
+function sendMessage(text, type = "msg", retry = false) {
+  if (!session || !activePeerMid) return false;
+  if (retry) return drainOutbox(activePeerMid, true);
   const conversation = conversationFor(activePeerMid);
-  const generation = sessionGeneration;
+  if (conversation.finished) return false;
   const peerMid = activePeerMid;
-  const submittedDraft = ui.messageInput.value;
+  const fromComposer = type === "msg";
   if (type === "msg" && conversation.replyingFinal) type = "done";
-  if (conversation.pendingSend && !retry) {
-    showToast("Retry the unconfirmed message before sending another.", true);
+  const thread = ensureThread(conversation);
+  const payload = { thread, seq: conversation.seq, type, text };
+  if (new TextEncoder().encode(JSON.stringify(payload)).byteLength > 64 * 1024) {
+    showToast("This message exceeds the 64 KiB payload limit. Shorten it before sending.", true);
     return false;
   }
-  if (conversation.finished && !retry) return false;
-  if (!conversation.pendingSend) {
-    const thread = ensureThread(conversation);
-    const seq = conversation.seq;
-    conversation.pendingSend = {
-      key: `${thread}-h${seq}`,
-      body: { to: peerMid, payload: { thread, seq, type, text } },
-      draft: submittedDraft,
-      revision: conversation.draftRevision || 0,
-    };
-    saveSession();
-  }
-  const pending = conversation.pendingSend;
-  const payload = pending.body.payload;
-  sending = true;
-  renderConversation();
-  try {
-    const accepted = await api("/v1/agent/send", {
-      method: "POST",
-      idempotencyKey: pending.key,
-      body: pending.body,
-    });
-    if (generation !== sessionGeneration) return false;
-    if (typeof accepted?.id !== "string" || !Number.isFinite(accepted.ts)) throw new ApiError(502, "Message acceptance could not be confirmed. Retry the saved message.");
-    // Incoming IDs belong to our mailbox; accepted IDs belong to the peer's.
-    // Only an earlier outgoing message can be a duplicate of this acceptance.
-    if (!conversation.messages.some((message) => message.mine && message.id === accepted.id)) appendMessage(conversation, {
-      id: accepted.id,
-      type: payload.type,
-      text: payload.text,
-      ts: accepted.ts,
-      mine: true,
-    });
-    if (conversation.thread === payload.thread) {
-      conversation.seq = Math.max(conversation.seq, payload.seq + 1);
-      if (payload.type === "final") conversation.awaitingFinal = true;
-      if (payload.type === "done") { conversation.finished = true; conversation.replyingFinal = false; }
-    }
-    if (activePeerMid === peerMid && conversation.finished) stopTyping();
-    if (["msg", "done"].includes(payload.type) && (conversation.draftRevision || 0) === (pending.revision || 0) && (conversation.draft || "") === pending.draft) {
-      conversation.draft = "";
-      if (activePeerMid === peerMid && ui.messageInput.value === pending.draft) ui.messageInput.value = "";
-    }
-    conversation.pendingSend = null;
-    saveSession();
+  const pending = { key: `web-${randomId()}`, body: { to: peerMid, payload }, ts: Date.now(), status: "queued" };
+  conversation.outbox.push(pending);
+  conversation.seq += 1;
+  appendMessage(conversation, outgoingMessage(pending));
+  if (type === "final") conversation.awaitingFinal = true;
+  if (type === "done") { conversation.finished = true; conversation.replyingFinal = false; }
+  if (fromComposer) {
+    conversation.draft = "";
+    ui.messageInput.value = "";
     resizeComposer();
-    renderConversation({ scrollToLatest: activePeerMid === peerMid });
-    return true;
-  } catch (error) {
-    if (generation !== sessionGeneration) return false;
-    if (error.status >= 400 && error.status < 500 && ![408, 409, 429].includes(error.status)) {
-      conversation.pendingSend = null;
-      saveSession();
+  }
+  // Persist and display the note before starting delivery, as the iOS composer
+  // does. Reserve the sequence now so a second submission is independent.
+  saveSession();
+  renderConversation({ scrollToLatest: true });
+  void drainOutbox(peerMid);
+  return true;
+}
+
+async function drainOutbox(peerMid, retry = false) {
+  if (!session || activeSends.has(peerMid)) return;
+  const conversation = conversationFor(peerMid);
+  if (!conversation.outbox.length || (conversation.outbox[0].status === "unconfirmed" && !retry)) return;
+  const generation = sessionGeneration;
+  const attempt = {};
+  activeSends.set(peerMid, attempt);
+  try {
+    while (generation === sessionGeneration && conversation.outbox.length) {
+      const pending = conversation.outbox[0];
+      if (pending.status === "unconfirmed" && !retry) break;
+      retry = false;
+      if (pending.status === "unconfirmed") {
+        pending.status = "queued";
+        saveSession();
+        if (activePeerMid === peerMid) renderConversation();
+      }
+      try {
+        const accepted = await api("/v1/agent/send", { method: "POST", idempotencyKey: pending.key, body: pending.body });
+        if (generation !== sessionGeneration) return;
+        if (typeof accepted?.id !== "string" || !Number.isFinite(accepted.ts)) throw new ApiError(502, "Message acceptance could not be confirmed.");
+        // Keep the optimistic row's client identity and DOM node on acceptance.
+        const message = conversation.messages.find((message) => message.clientId === pending.key);
+        Object.assign(message, { id: accepted.id, ts: accepted.ts, pending: false });
+        conversation.outbox.shift();
+        trimMessages(conversation);
+        if (conversation.thread === pending.body.payload.thread) {
+          if (pending.body.payload.type === "final") conversation.awaitingFinal = true;
+          if (pending.body.payload.type === "done") { conversation.finished = true; conversation.replyingFinal = false; }
+        }
+        saveSession();
+        if (activePeerMid === peerMid) renderConversation();
+      } catch (error) {
+        if (generation !== sessionGeneration) return;
+        pending.status = "unconfirmed";
+        saveSession();
+        if (activePeerMid === peerMid) showToast(error.message, true);
+        break;
+      }
     }
-    if (error.status === 409) {
-      showToast("The saved request conflicts with a previous send. Sign out and reconnect to reconcile the mailbox.", true);
-    } else {
-      showToast(error.message, true);
-    }
-    return false;
   } finally {
-    if (generation === sessionGeneration) {
-      sending = false;
-      renderConversation();
+    if (activeSends.get(peerMid) === attempt) {
+      activeSends.delete(peerMid);
+      if (activePeerMid === peerMid) renderConversation();
     }
   }
 }
@@ -1182,9 +1242,8 @@ ui.retrySend.addEventListener("pointerdown", (event) => {
   if (event.isPrimary && event.button === 0) { event.preventDefault(); ui.messageInput.focus({ preventScroll: true }); }
 });
 ui.newChat.addEventListener("click", () => {
-  if (!session || !activePeerMid || sending) return;
+  if (!session || !activePeerMid) return;
   const conversation = conversationFor(activePeerMid);
-  if (conversation.pendingSend) return;
   beginConversation(conversation);
   saveSession();
   renderConversation();

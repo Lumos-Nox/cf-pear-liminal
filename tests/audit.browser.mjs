@@ -55,7 +55,7 @@ try {
   await page.getByRole("button", { name: /^Bob,/ }).click();
   assert.equal(await page.locator("#messageInput").inputValue(), "New draft to keep");
   await page.locator("#retrySend").click();
-  await page.waitForFunction(() => !document.querySelector("#sendButton").disabled);
+  await page.waitForFunction(() => !document.querySelector('#messageList [data-delivery="queued"], #messageList [data-delivery="unconfirmed"]'));
   assert.equal(await page.locator("#messageInput").inputValue(), "New draft to keep");
   let state = await control("state");
   const sends = state.requests.filter((request) => request.path === "/v1/agent/send");
@@ -107,6 +107,7 @@ try {
   assert.ok((await page.locator("#messageInput").getAttribute("placeholder")).includes("final summary"));
   await send(page, "The final summary from a human");
   await page.locator("#newChat").waitFor({ state: "visible" });
+  await page.waitForFunction(() => !document.querySelector('#messageList [data-delivery="queued"]'));
   state = await control("state");
   assert.equal(state.requests.filter((request) => request.path === "/v1/agent/send").at(-1).body.payload.type, "done");
   await page.context().close();
@@ -116,6 +117,7 @@ try {
   page = await open({ storageFailure: true });
   await send(page, "Storage unavailable");
   await page.getByText("Storage unavailable", { exact: true }).waitFor();
+  await page.locator('.message-row[data-delivery="confirmed"]').waitFor();
   assert.ok((await page.locator("#toast").textContent()).includes("could not save"));
   await page.context().close();
   console.log("PASS: storage quota failures do not break connected chat or successful sends");

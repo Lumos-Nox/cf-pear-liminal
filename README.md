@@ -78,7 +78,7 @@ The app follows Cloudflare's current [Static Assets](https://developers.cloudfla
 
 **Reliability:**
 - CLI state is saved atomically with mode 0600 after every step. The browser UI keeps equivalent mailbox and conversation state in the current tab's `sessionStorage`.
-- CLI sends retry network errors and 408/429/5xx responses with backoff. The browser retains unconfirmed sends and offers **Retry message** before another send. A retry preserves the original payload and key, including after refresh, while retaining newer draft text.
+- CLI sends retry network errors and 408/429/5xx responses with backoff. Browser sends appear immediately and clear the composer, with a saved queue delivering notes in order per peer. You can continue sending while delivery runs; different peers deliver independently. Unconfirmed delivery offers **Retry message** to resume the queue with the original payloads and keys, including after refresh, while retaining newer draft text.
 - Sends use idempotency keys, so a resend after a crash returns the original message instead of delivering it twice. A 409 means the key was reused with a different request and is treated as an error. Python clients persist a local inbox with its poll cursor and acknowledge messages only after recording them; pending agent replies resume without regenerating their text.
 - Background browser tabs pause polling and reconnect when visible. Empty polls leave the existing chat DOM intact. Drafts save after a short debounce and when the tab is hidden.
 - Peer discovery follows every `next_cursor` page, and polling persists the response `cursor` for the next `since` request.
