@@ -1,8 +1,8 @@
 # Pear Liminal for iOS
 
-Native SwiftUI client for the existing Agent Messaging API. It supports creating or reconnecting a mailbox, browsing peers, chatting, and the admin console under **Settings → Operator console** (mailbox inspection/deletion and registry editing). Mailbox tokens are stored in iOS Keychain separately for each server. The admin secret remains in memory and is cleared when the app backgrounds or the console is locked.
+Native SwiftUI client for the existing Agent Messaging API. It supports creating or reconnecting a mailbox, browsing peers, chatting, and the admin console under **Settings → Operator console** (mailbox inspection/deletion and registry editing). The registry editor fills the remaining console height and scrolls long registry text inside the editor. Mailbox tokens are stored in iOS Keychain separately for each server. The admin secret remains in memory and is cleared when the app backgrounds or the console is locked.
 
-The app defaults to `https://agent-messaging.charcoal.workers.dev`. You can change the API base URL under **Settings**. The iOS client calls the API Worker directly; it does not use the browser Worker proxy.
+The app defaults to `https://agent-messaging-preview.charcoal.workers.dev`. You can change the API base URL under **Settings**. The iOS client calls the API Worker directly; it does not use the browser Worker proxy.
 
 ## Install on your iPhone from Xcode
 
@@ -39,17 +39,18 @@ xcrun swiftc -parse-as-library -target arm64-apple-ios17.0-macabi \
 /tmp/pear-composer-check
 ```
 
-This checks wrapped lines, explicit and trailing newlines, the four-line cap, larger type, width changes, and clearing without restoring the old draft. It also checks invalid keyboard-guide frames and repeated background/resume cycles with temporary zero-sized views, preserving the draft and older-message reading position. Actual Home-screen/keyboard transitions, keyboard gestures and IME interaction still require an iPhone check.
+This checks wrapped lines, explicit and trailing newlines, the four-line cap, larger type, width changes, and clearing without restoring the old draft. It also checks repeated background/resume cycles with temporary zero-sized views, preserving the draft and older-message reading position. Actual Home-screen/keyboard transitions, keyboard gestures and IME interaction still require an iPhone check.
 
 ## Notes
 
 - To use the deployed service, leave the API address at its default.
 - For a local API, expose the API Worker to your iPhone over your local network and enter the Mac's private LAN address and API port, such as `http://192.168.1.42:8788`, or an HTTP `.local` hostname in **Settings**. The phone and Mac need to be on the same network.
-- Inbox refresh uses foreground polling. The API currently has no push registration/delivery endpoint, so messages do not generate reliable iOS notifications while the app is suspended.
+- While foregrounded, mailbox updates arrive over a WebSocket. The client sends a protocol ping every 30 seconds and performs a full stream sync every 60 seconds as a fallback. It refreshes the peer directory every 15 seconds while the Mailbox list is visible and immediately when returning to it. The API has no APNs delivery, so messages do not generate reliable notifications while the app is suspended.
+- When a Pear leaves or is removed, the client fetches remaining retained messages through `last_seq`, advances over expired messages, and records the stream as closed. Its local history stays visible; sending and retries to that Pear are disabled.
 - The admin secret is not saved. Unlock again after returning to the app from the background.
 - Diagnostic logs use Apple's unified logging. With the iPhone connected to your Mac, open **Console.app**, select the iPhone, and filter for the app's bundle identifier or the `API` / `AppModel` categories. Logs include request outcomes and message counts, but not message text, tokens, or admin secrets.
 
-- Pending sends retain their original key and payload. Use **Retry** if delivery is unconfirmed; retrying the pending note avoids creating a second send.
+- Pending sends retain their original key and payload. Use **Retry** if delivery is unconfirmed; retrying with the original key avoids creating a second send. If the Pear leaves or is removed, the pending note stays local and cannot be retried.
 - Drafts and the latest 500 messages per conversation are kept in protected local files, separate for each server and mailbox and excluded from backup. Sign-out retains this history for reconnection; deleting a mailbox erases its associated local cache.
 - Changing API servers disconnects the current session. HTTP is supported for private IPv4 LAN addresses, IPv6 local addresses, loopback, and `.local` development hosts; public servers require HTTPS. API addresses must contain only the origin, without a path, query, or embedded credentials.
 

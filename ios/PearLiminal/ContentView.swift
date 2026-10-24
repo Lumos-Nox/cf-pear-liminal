@@ -10,17 +10,25 @@ private enum PearTheme {
     static let canvas = Color(uiColor: .systemGroupedBackground)
 }
 
+private enum PrimaryTab: Hashable {
+    case mailbox
+    case settings
+}
+
 struct ContentView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.scenePhase) private var scenePhase
     @State private var showAdmin = false
+    @State private var selectedTab: PrimaryTab = .mailbox
 
     var body: some View {
-        TabView {
-            MailboxView()
+        TabView(selection: $selectedTab) {
+            MailboxView(isSelected: selectedTab == .mailbox)
                 .tabItem { Label("Mailbox", systemImage: "bubble.left.and.bubble.right") }
+                .tag(PrimaryTab.mailbox)
             SettingsView(showAdmin: $showAdmin)
                 .tabItem { Label("Settings", systemImage: "gearshape") }
+                .tag(PrimaryTab.settings)
         }
         .tint(PearTheme.accent)
         .alert("Pear Liminal", isPresented: Binding(
@@ -279,6 +287,7 @@ private struct PasswordActionRow: View {
 struct MailboxView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.scenePhase) private var scenePhase
+    let isSelected: Bool
     @State private var hasStarted = false
     @State private var reconnecting = false
     @State private var label = ""
@@ -286,6 +295,10 @@ struct MailboxView: View {
     @State private var token = ""
     @State private var search = ""
     @State private var confirmDelete = false
+
+    private var shouldRefreshPeers: Bool {
+        isSelected && scenePhase == .active && model.mailbox != nil && model.selectedPeerID == nil
+    }
 
     private var visiblePeers: [Peer] {
         var peers = model.peers
@@ -481,6 +494,17 @@ struct MailboxView: View {
         .listSectionSpacing(10)
         .searchable(text: $search, prompt: "Find a Pear")
         .refreshable { await model.refreshPeers(); await model.refreshInbox() }
+        .task(id: shouldRefreshPeers) {
+            guard shouldRefreshPeers else { return }
+            // Refresh immediately on first display and whenever the user returns
+            // from a conversation, another tab, or an inactive app state.
+            await model.refreshPeers()
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(15)) } catch { return }
+                guard shouldRefreshPeers else { return }
+                await model.refreshPeers()
+            }
+        }
     }
 
     private func conversationsHeader(count: Int) -> some View {
@@ -499,9 +523,25 @@ struct MailboxView: View {
     private func peerRow(_ peer: Peer) -> some View {
         let last = model.conversations[peer.mid]?.last
         let pending = model.pendingMessages(for: peer.mid).last
+        let peerIsClosed = model.isPeerClosed(peer.mid)
+        let closureLabel = model.peerClosureLabel(peer.mid)
         let deliveryUnconfirmed = pending.map { model.unconfirmedIDs.contains($0.id) } ?? false
         let unread = model.history.unread[peer.mid] ?? 0
         let draft = model.draft(for: peer.mid)
+        let preview: String
+        if peerIsClosed, pending != nil {
+            preview = "Not sent · \(closureLabel ?? "Closed")"
+        } else if deliveryUnconfirmed && !peerIsClosed {
+            preview = "Delivery unconfirmed · Tap to retry"
+        } else if let pending {
+            preview = "You: " + pending.payload.text
+        } else if !draft.isEmpty {
+            preview = "Draft: \(draft)"
+        } else if let last {
+            preview = (last.from == model.mailbox?.mid ? "You: " : "") + last.text
+        } else {
+            preview = "Send the first note"
+        }
         return HStack(alignment: .center, spacing: 13) {
             PearAvatar(name: peer.label.isEmpty ? "?" : peer.label)
             VStack(alignment: .leading, spacing: 5) {
@@ -509,15 +549,20 @@ struct MailboxView: View {
                     Text(peer.label.isEmpty ? peer.mid.shortMID : peer.label)
                         .font(.headline).lineLimit(1)
                     Spacer(minLength: 8)
+                    if let closureLabel {
+                        Text(closureLabel)
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.secondary)
+                    }
                     if let last {
                         Text(Date(timeIntervalSince1970: Double(last.timestamp) / 1000), style: .time)
                             .font(.caption2).foregroundStyle(.secondary)
                     }
                 }
                 HStack(alignment: .top) {
-                    Text(deliveryUnconfirmed ? "Delivery unconfirmed · Tap to retry" : pending.map { "You: " + $0.payload.text } ?? (!draft.isEmpty ? "Draft: \(draft)" : last.map { ($0.from == model.mailbox?.mid ? "You: " : "") + $0.text } ?? "Send the first note"))
+                    Text(preview)
                         .font(.subheadline)
-                        .foregroundStyle(deliveryUnconfirmed ? Color.orange : Color.secondary)
+                        .foregroundStyle(deliveryUnconfirmed && !peerIsClosed ? Color.orange : Color.secondary)
                         .lineLimit(2)
                     Spacer(minLength: 4)
                     // Reserve the largest badge's footprint even when read,
@@ -561,6 +606,16 @@ struct ChatView: View {
 
     private var messages: [ChatMessage] { model.conversations[peer.mid] ?? [] }
     private var pending: [PendingMessage] { model.pendingMessages(for: peer.mid) }
+    private var peerIsClosed: Bool { model.isPeerClosed(peer.mid) }
+    private var closureLabel: String? { model.peerClosureLabel(peer.mid) }
+    private var closureNotice: (title: String, detail: String)? {
+        guard let closureLabel else { return nil }
+        switch closureLabel {
+        case "Closing": return ("Closing this pear.", "Syncing the final messages.")
+        case "Left": return ("This pear left.", "Let the final note settle into memory.")
+        default: return ("This pear was removed.", "Let the final note settle into memory.")
+        }
+    }
 
     var body: some View {
         ConversationViewport(contentVersion: contentVersion, latestRequest: latestRequest,
@@ -570,7 +625,6 @@ struct ChatView: View {
             followsLatest = following
             if following { hasNewMessages = false }
         }
-        .ignoresSafeArea(.keyboard, edges: .bottom)
         .onChange(of: messages.last?.id) { _, _ in
             if !followsLatest && messages.last?.from != model.mailbox?.mid { hasNewMessages = true }
         }
@@ -600,7 +654,7 @@ struct ChatView: View {
 
     // Keep rows stable across acknowledgement. Draft edits do not invalidate layout.
     private var contentVersion: [String] {
-        [model.mailboxConnectionWarning ?? "", peer.mid, peer.label]
+        [model.mailboxConnectionWarning ?? "", closureLabel ?? "", peer.mid, peer.label]
             + transcriptEntries.map { entry in
                 entry.id + (entry.pending == nil ? ":sent" : model.unconfirmedIDs.contains(entry.id) ? ":retry" : ":pending")
             }
@@ -630,14 +684,36 @@ struct ChatView: View {
                                   isMine: entry.pending != nil || entry.message.from == model.mailbox?.mid,
                                   maxWidth: min(width * 0.82, 560), isPending: entry.pending != nil)
                         .padding(.top, index > 0 && entries[index - 1].message.from == entry.message.from ? 0 : 10)
-                    if let item = entry.pending, model.unconfirmedIDs.contains(item.id) {
-                        Button { Task { await model.retryMessage(item) } } label: {
-                            Label("Delivery unconfirmed · Retry", systemImage: "arrow.clockwise")
-                                .font(.caption.weight(.medium)).frame(minHeight: 44)
+                    if let item = entry.pending {
+                        if peerIsClosed {
+                            Text("Not sent · \(closureLabel ?? "Conversation closed")")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.secondary)
+                                .frame(minHeight: 44)
+                                .frame(maxWidth: .infinity, alignment: .trailing)
+                        } else if model.unconfirmedIDs.contains(item.id) {
+                            Button { Task { await model.retryMessage(item) } } label: {
+                                Label("Delivery unconfirmed · Retry", systemImage: "arrow.clockwise")
+                                    .font(.caption.weight(.medium)).frame(minHeight: 44)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .trailing)
                         }
-                        .frame(maxWidth: .infinity, alignment: .trailing)
                     }
                 }
+            }
+            if let closureNotice {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "person.crop.circle.badge.xmark")
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(closureNotice.title)
+                            .font(.subheadline.weight(.medium))
+                        Text(closureNotice.detail)
+                            .font(.caption)
+                    }
+                    .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 12)
             }
         }
         .padding(.horizontal, 16).padding(.bottom, 12)
@@ -691,6 +767,7 @@ struct ChatView: View {
                 .contentShape(Rectangle())
                 .simultaneousGesture(TapGesture().onEnded { composerEditor.view?.becomeFirstResponder() })
                 .accessibilityLabel("Message")
+                .disabled(peerIsClosed)
             Button(action: send) {
                 Image(systemName: "arrow.up")
                     .font(.system(size: 19, weight: .semibold))
@@ -705,7 +782,7 @@ struct ChatView: View {
         }
     }
 
-    private var canSend: Bool { pending.isEmpty && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    private var canSend: Bool { !peerIsClosed && pending.isEmpty && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     private func send() {
         guard canSend else { return }
         let text = composerEditor.committedText(fallback: draft)
@@ -994,38 +1071,50 @@ struct AdminView: View {
     }
 
     private var registryEditor: some View {
-        Form {
-            Section("Public registry") {
-                Picker("Resource", selection: $registry) {
-                    ForEach(RegistryKind.allCases) { kind in Text(kind.title).tag(kind) }
-                }
-                if let error = model.registryError {
-                    Text(error).font(.footnote).foregroundStyle(.red)
-                    Button("Reload registries") { Task { await model.loadAdminRegistries() } }
-                        .disabled(model.isLoadingRegistries || model.isWorking)
-                }
-                TextEditor(text: Binding(
-                    get: { model.registryTexts[registry] ?? "" },
-                    set: { model.updateRegistryText($0, kind: registry) }
-                ))
-                .font(.system(.caption, design: .monospaced))
-                .frame(minHeight: 300)
-                .disabled(model.isLoadingRegistries || model.registryTexts[registry] == nil)
-                .overlay {
-                    if model.isLoadingRegistries { ProgressView("Loading registries…") }
-                }
-                Button {
-                    Task { await model.saveRegistry(registry) }
-                } label: {
-                    if model.isWorking { ProgressView().frame(maxWidth: .infinity) }
-                    else { Text("Save \(registry.title.lowercased())").frame(maxWidth: .infinity) }
-                }
-                .disabled(model.isWorking || model.isLoadingRegistries || model.registryTexts[registry] == nil)
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Public registry")
+                .font(.headline)
+
+            Picker("Resource", selection: $registry) {
+                ForEach(RegistryKind.allCases) { kind in Text(kind.title).tag(kind) }
             }
+
+            if let error = model.registryError {
+                Text(error).font(.footnote).foregroundStyle(.red)
+                Button("Reload registries") { Task { await model.loadAdminRegistries() } }
+                    .disabled(model.isLoadingRegistries || model.isWorking)
+            }
+
+            TextEditor(text: Binding(
+                get: { model.registryTexts[registry] ?? "" },
+                set: { model.updateRegistryText($0, kind: registry) }
+            ))
+            .font(.system(.caption, design: .monospaced))
+            .scrollContentBackground(.hidden)
+            .padding(10)
+            .frame(minHeight: 0, maxHeight: .infinity)
+            .background(Color(uiColor: .systemBackground), in: RoundedRectangle(cornerRadius: 14))
+            .disabled(model.isLoadingRegistries || model.registryTexts[registry] == nil)
+            .overlay {
+                if model.isLoadingRegistries { ProgressView("Loading registries…") }
+            }
+
+            Button {
+                Task { await model.saveRegistry(registry) }
+            } label: {
+                if model.isWorking { ProgressView().frame(maxWidth: .infinity) }
+                else { Text("Save \(registry.title.lowercased())").frame(maxWidth: .infinity) }
+            }
+            .disabled(model.isWorking || model.isLoadingRegistries || model.registryTexts[registry] == nil)
+
             if let status = model.registryStatus {
-                Section { Text(status).foregroundStyle(.secondary) }
+                Text(status).font(.footnote).foregroundStyle(.secondary)
             }
         }
+        .padding(16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 20))
+        .padding(.horizontal, 16)
     }
 }
 

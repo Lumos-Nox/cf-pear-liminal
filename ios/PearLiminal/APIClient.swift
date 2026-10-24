@@ -2,8 +2,20 @@ import Foundation
 import OSLog
 import Darwin
 
+enum LogTimestamp {
+    static func prefix(at date: Date = Date()) -> String {
+        let components = Calendar.current.dateComponents([.hour, .minute, .second, .nanosecond], from: date)
+        let milliseconds = (components.nanosecond ?? 0) / 1_000_000
+        return String(
+            format: "[%02d:%02d:%02d.%03d]",
+            locale: Locale(identifier: "en_US_POSIX"),
+            arguments: [components.hour ?? 0, components.minute ?? 0, components.second ?? 0, milliseconds]
+        )
+    }
+}
+
 struct APIClient {
-    static let productionURL = URL(string: "https://agent-messaging.charcoal.workers.dev")!
+    static let productionURL = URL(string: "https://liminal.iyctt.com")!
 
     let baseURL: URL
     private let session: URLSession
@@ -23,6 +35,42 @@ struct APIClient {
     init(baseURL: URL = APIClient.productionURL, session: URLSession? = nil) {
         self.baseURL = baseURL
         self.session = session ?? Self.secureSession
+    }
+
+    func webSocketTask(_ path: String, token: String) throws -> URLSessionWebSocketTask {
+        guard path.hasPrefix("/v1/"), let url = URL(string: path, relativeTo: baseURL)?.absoluteURL,
+              url.host == baseURL.host, url.port == baseURL.port,
+              let scheme = url.scheme, scheme == baseURL.scheme,
+              var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            throw APIError(statusCode: nil, message: "The API address is invalid.")
+        }
+        components.scheme = scheme == "https" ? "wss" : "ws"
+        guard let socketURL = components.url else {
+            throw APIError(statusCode: nil, message: "The API address is invalid.")
+        }
+        var request = URLRequest(url: socketURL)
+        request.timeoutInterval = 15
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        return session.webSocketTask(with: request)
+    }
+
+    /// Sends an RFC 6455 ping control frame (opcode 0x9) and waits for its pong.
+    func sendWebSocketPing(_ task: URLSessionWebSocketTask) async throws {
+        try Task.checkCancellation()
+        logger.debug("\(LogTimestamp.prefix(), privacy: .public) WebSocket protocol ping sent")
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            task.sendPing { error in
+                if let error {
+                    logger.warning("\(LogTimestamp.prefix(), privacy: .public) WebSocket protocol ping failed before pong: \(String(describing: error), privacy: .private)")
+                    continuation.resume(throwing: error)
+                } else {
+                    logger.debug("\(LogTimestamp.prefix(), privacy: .public) WebSocket pong received")
+                    continuation.resume(returning: ())
+                }
+            }
+        }
+        try Task.checkCancellation()
     }
 
     /// Credentials belong to an origin, never a path, query, or user-info URL.
@@ -170,17 +218,17 @@ struct APIClient {
             let (data, response) = try await session.data(for: request)
             try Task.checkCancellation()
             guard let http = response as? HTTPURLResponse else {
-                logger.error("\(method, privacy: .public) request returned a non-HTTP response.")
+                logger.error("\(LogTimestamp.prefix(), privacy: .public) \(method, privacy: .public) request returned a non-HTTP response.")
                 throw APIError(statusCode: nil, message: "The server returned an invalid response.")
             }
             guard (200..<300).contains(http.statusCode) else {
                 let payload = try? JSONDecoder().decode(ErrorPayload.self, from: data)
                 let elapsedMilliseconds = Int(Date().timeIntervalSince(startedAt) * 1000)
-                logger.error("\(method, privacy: .public) request to \(url.path, privacy: .private) failed with HTTP \(http.statusCode, privacy: .public) in \(elapsedMilliseconds, privacy: .public) ms.")
+                logger.error("\(LogTimestamp.prefix(), privacy: .public) \(method, privacy: .public) request to \(url.path, privacy: .private) failed with HTTP \(http.statusCode, privacy: .public) in \(elapsedMilliseconds, privacy: .public) ms.")
                 throw APIError(statusCode: http.statusCode, message: payload?.error ?? "Request failed (HTTP \(http.statusCode)).")
             }
             let elapsedMilliseconds = Int(Date().timeIntervalSince(startedAt) * 1000)
-            logger.debug("\(method, privacy: .public) request to \(url.path, privacy: .private) succeeded with HTTP \(http.statusCode, privacy: .public) in \(elapsedMilliseconds, privacy: .public) ms.")
+            logger.debug("\(LogTimestamp.prefix(), privacy: .public) \(method, privacy: .public) request to \(url.path, privacy: .private) succeeded with HTTP \(http.statusCode, privacy: .public) in \(elapsedMilliseconds, privacy: .public) ms.")
             return (data, http)
         } catch is CancellationError {
             throw CancellationError()
@@ -190,7 +238,7 @@ struct APIClient {
             throw error
         } catch {
             let elapsedMilliseconds = Int(Date().timeIntervalSince(startedAt) * 1000)
-            logger.error("\(method, privacy: .public) request to \(url.path, privacy: .private) failed after \(elapsedMilliseconds, privacy: .public) ms: \(error.localizedDescription, privacy: .private)")
+            logger.error("\(LogTimestamp.prefix(), privacy: .public) \(method, privacy: .public) request to \(url.path, privacy: .private) failed after \(elapsedMilliseconds, privacy: .public) ms: \(error.localizedDescription, privacy: .private)")
             throw APIError(statusCode: nil, message: error.localizedDescription)
         }
     }
@@ -284,20 +332,46 @@ struct PollPage: Decodable {
     }
 }
 
+struct StreamList: Decodable {
+    let streams: [MailboxStream]
+}
+
+struct MailboxStream: Decodable, Identifiable {
+    let peer: String
+    let peerStatus: String?
+    let peerStatusAt: Int64?
+    let lastSeq: Int64
+    let messages: Int
+    let lastTs: Int64
+
+    var id: String { peer }
+}
+
 struct InboxMessage: Decodable, Identifiable {
     let id: String
     let from: String
     let payload: MessagePayload
     let ts: Int64
+    let seq: Int64?
 
-    private enum CodingKeys: String, CodingKey { case id, from, payload, ts }
+    private enum CodingKeys: String, CodingKey { case id, from, payload, ts, seq }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(String.self, forKey: .id)
         from = try values.decode(String.self, forKey: .from)
         ts = try values.decode(Int64.self, forKey: .ts)
+        seq = try? values.decode(Int64.self, forKey: .seq)
         payload = (try? values.decode(MessagePayload.self, forKey: .payload)) ?? MessagePayload(text: nil, type: nil, thread: nil)
     }
+}
+
+struct PushEvent: Decodable {
+    let type: String
+    let message: PushMessage?
+}
+
+struct PushMessage: Decodable {
+    let from: String
 }
 
 struct MessagePayload: Decodable {

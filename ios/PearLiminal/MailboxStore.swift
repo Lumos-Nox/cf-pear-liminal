@@ -8,6 +8,12 @@ struct PendingMessage: Codable, Identifiable {
     let timestamp: Int64
 }
 
+struct ClosedStreamRecord: Codable, Equatable {
+    let peerStatus: String
+    let peerStatusAt: Int64?
+    let lastSeq: Int64
+}
+
 struct MailboxHistory: Codable {
     var cursor = "0"
     var conversations: [String: [ChatMessage]] = [:]
@@ -16,6 +22,27 @@ struct MailboxHistory: Codable {
     var threads: [String: String] = [:]
     var unread: [String: Int] = [:]
     var sequences: [String: Int] = [:]
+    var streamCursors: [String: Int64] = [:]
+    var closedStreams: [String: ClosedStreamRecord] = [:]
+
+    private enum CodingKeys: String, CodingKey {
+        case cursor, conversations, pending, drafts, threads, unread, sequences, streamCursors, closedStreams
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        cursor = try values.decodeIfPresent(String.self, forKey: .cursor) ?? "0"
+        conversations = try values.decodeIfPresent([String: [ChatMessage]].self, forKey: .conversations) ?? [:]
+        pending = try values.decodeIfPresent([PendingMessage].self, forKey: .pending) ?? []
+        drafts = try values.decodeIfPresent([String: String].self, forKey: .drafts) ?? [:]
+        threads = try values.decodeIfPresent([String: String].self, forKey: .threads) ?? [:]
+        unread = try values.decodeIfPresent([String: Int].self, forKey: .unread) ?? [:]
+        sequences = try values.decodeIfPresent([String: Int].self, forKey: .sequences) ?? [:]
+        streamCursors = try values.decodeIfPresent([String: Int64].self, forKey: .streamCursors) ?? [:]
+        closedStreams = try values.decodeIfPresent([String: ClosedStreamRecord].self, forKey: .closedStreams) ?? [:]
+    }
 }
 
 /// Serializes disk work away from the main actor. No credentials are written here.

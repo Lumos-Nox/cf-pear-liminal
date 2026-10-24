@@ -34,8 +34,6 @@ final class ConversationViewportController: UIViewController, UIScrollViewDelega
     private var needsMeasurement = true
     private var onFollowChange: ((Bool) -> Void)?
     private var composerHeight: NSLayoutConstraint!
-    private var keyboardBottom: NSLayoutConstraint!
-    private var restingBottom: NSLayoutConstraint!
     private var scenePhase: ScenePhase = .active
 
     override func viewDidLoad() {
@@ -71,9 +69,6 @@ final class ConversationViewportController: UIViewController, UIScrollViewDelega
         composerHeight = composerHost.view.heightAnchor.constraint(equalToConstant: 68)
 
         let safeArea = view.safeAreaLayoutGuide
-        view.keyboardLayoutGuide.usesBottomSafeArea = true
-        keyboardBottom = composerHost.view.bottomAnchor.constraint(equalTo: view.keyboardLayoutGuide.topAnchor)
-        restingBottom = composerHost.view.bottomAnchor.constraint(equalTo: safeArea.bottomAnchor)
         NSLayoutConstraint.activate([
             composerHeight,
             scrollView.topAnchor.constraint(equalTo: safeArea.topAnchor),
@@ -83,7 +78,7 @@ final class ConversationViewportController: UIViewController, UIScrollViewDelega
             scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 0),
             composerHost.view.leadingAnchor.constraint(equalTo: safeArea.leadingAnchor),
             composerHost.view.trailingAnchor.constraint(equalTo: safeArea.trailingAnchor),
-            restingBottom,
+            composerHost.view.bottomAnchor.constraint(equalTo: safeArea.bottomAnchor),
         ])
 
         // A short transcript has nothing to scroll or rubber-band. Still allow
@@ -104,7 +99,6 @@ final class ConversationViewportController: UIViewController, UIScrollViewDelega
         if wasBackgrounded && phase != .background {
             needsMeasurement = true
         }
-        updateComposerAnchor()
         view.setNeedsLayout()
     }
 
@@ -116,21 +110,6 @@ final class ConversationViewportController: UIViewController, UIScrollViewDelega
         return frame.minY >= safeArea.minY + composerHeight
             && frame.minY <= safeArea.maxY + 1
             && frame.maxY >= safeArea.maxY - 1
-    }
-
-    @discardableResult private func updateComposerAnchor() -> Bool {
-        let followKeyboard = scenePhase != .background && Self.keyboardGuideIsUsable(
-            view.keyboardLayoutGuide.layoutFrame, safeArea: view.safeAreaLayoutGuide.layoutFrame,
-            composerHeight: composerHeight.constant)
-        guard keyboardBottom.isActive != followKeyboard else { return false }
-        if followKeyboard {
-            restingBottom.isActive = false
-            keyboardBottom.isActive = true
-        } else {
-            keyboardBottom.isActive = false
-            restingBottom.isActive = true
-        }
-        return true
     }
 
     func update(contentVersion: [String], latestRequest: Int, transcript: @escaping (CGFloat) -> AnyView,
@@ -155,9 +134,6 @@ final class ConversationViewportController: UIViewController, UIScrollViewDelega
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
-        // The guide has its updated frame only after UIKit lays out the view.
-        // Resolve the anchor in this transaction, including on foregrounding.
-        if updateComposerAnchor() { view.layoutIfNeeded() }
         guard scenePhase != .background, view.bounds.width > 0, view.bounds.height > 0 else { return }
         let composerWidth = composerHost.view.bounds.width
         if composerWidth > 0 {
